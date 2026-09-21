@@ -1,0 +1,54 @@
+/*
+ This is a sample extension to the Prisma schema for location-based models using PostGIS.
+ Please adapt it to your needs and merge it into your schema.prisma file.
+
+ Note: Prisma does not have built-in PostGIS support. You can use raw queries to interact with PostGIS functions.
+ Alternatively, you can store latitude and longitude as separate fields and use raw queries for distance calculations.
+
+ Steps to use PostGIS with Prisma:
+ 1. Ensure you have PostgreSQL with the PostGIS extension enabled.
+ 2. In your schema, you can store the location as a string (for WKT) or as separate latitude and longitude.
+ 3. Use Prisma's `$queryRaw` or `$executeRaw` to run PostGIS functions.
+
+ Example model for Restaurant:
+*/
+
+model Restaurant {
+  id        Int      @id @default(autoincrement())
+  name      String
+  address   String?
+  // Option 1: Store as a POINT in WKT format (requires PostGIS)
+  location  String   @db.Point   // This will create a POINT column in PostGIS
+  // Option 2: Store latitude and longitude as separate floats
+  latitude  Float
+  longitude Float
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Example of a raw query to find restaurants within a radius (in meters)
+  // You would create a method in your service layer that uses $queryRaw
+}
+
+/*
+ Example raw query to find restaurants within 10km of a given point (latitude: 40.7128, longitude: -74.0060):
+
+   SELECT * FROM "Restaurant"
+   WHERE ST_Distance(
+     location::geography,
+     ST_MakePoint(-74.0060, 40.7128)::geography
+   ) < 10000;
+
+ In Prisma, you can do:
+
+   const restaurants = await prisma.$queryRaw`
+     SELECT * FROM "Restaurant"
+     WHERE ST_Distance(
+       location::geography,
+       ST_MakePoint(${longitude}, ${latitude})::geography
+     ) < ${radiusInMeters}
+   `;
+
+ Note: Replace the table and column names as per your schema and the database's quoting rules.
+
+ For Redis Geo, you can use the GEOADD and GEORADIUS commands to store and query locations.
+*/

@@ -1,0 +1,147 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id            Int            @id @default(autoincrement())
+  email         String         @unique
+  phone         String?        @unique
+  password      String
+  name          String?
+  role          String         @default("NGO") // "NGO" | "RESTAURANT" | "ADMIN"
+  isVerified    Boolean        @default(false)
+  otp           String?
+  otpExpiry     DateTime?
+  refreshToken  String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  // Relations
+  restaurants   Restaurant[]
+  ngos          NGO[]
+  feedPosts     FeedPost[]
+  notifications Notification[]
+}
+
+model Restaurant {
+  id            Int          @id @default(autoincrement())
+  name          String
+  address       String?
+  phone         String?
+  fssaiNumber   String?
+  latitude      Float
+  longitude     Float
+  cuisineType   String?
+  rating        Float        @default(0.0)
+  isActive      Boolean      @default(true)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  ownerId       Int
+  owner         User         @relation(fields: [ownerId], references: [id])
+  feedPosts     FeedPost[]
+  listings      Listing[]
+}
+
+model NGO {
+  id                      Int           @id @default(autoincrement())
+  name                    String
+  tagline                 String?
+  address                 String?
+  phone                   String?
+  darpanId                String?
+  taxExemption            String?       // e.g. "Section 80G Certified"
+  latitude                Float
+  longitude               Float
+  mission                 String?
+  operatingBase           String?       @default("Main Logistics Depot")
+  defaultRadiusKm         Float         @default(8.0)
+  pickupMode              String        @default("NGO Representative Self-Pickup")
+  isActive                Boolean       @default(true)
+  isVerified              Boolean       @default(true)
+  
+  // Impact metrics
+  totalMealsRescued       Int           @default(0)
+  foodWastePreventedKg    Float         @default(0.0)
+  co2eAvoidedTonnes       Float         @default(0.0)
+  activePartners          Int           @default(0)
+
+  createdAt               DateTime      @default(now())
+  updatedAt               DateTime      @updatedAt
+  ownerId                 Int
+  owner                   User          @relation(fields: [ownerId], references: [id])
+  feedPosts               FeedPost[]
+  reservations            Reservation[]
+}
+
+model Listing {
+  id                  Int           @id @default(autoincrement())
+  foodName            String
+  category            String        // "Cooked Food", "Bakery", "Fresh Produce", etc.
+  totalServings       Int
+  availableServings   Int
+  preparedTime        String
+  safeUntil           DateTime
+  remainingHoursText  String?
+  isUrgent            Boolean       @default(false)
+  isVeg               Boolean       @default(true)
+  dietary             String[]      @default([]) // ["Pure Veg", "Halal", "Contains Dairy", etc.]
+  storageInstructions String?
+  imageUrl            String?
+  status              String        @default("ACTIVE") // "ACTIVE", "PARTIALLY_RESERVED", "FULLY_RESERVED", "EXPIRED", "COMPLETED"
+  restaurantId        Int
+  restaurant          Restaurant    @relation(fields: [restaurantId], references: [id])
+  reservations        Reservation[]
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+}
+
+model Reservation {
+  id                  Int       @id @default(autoincrement())
+  code                String    @unique // e.g. "RES-7104"
+  reservedServings    Int
+  pickupDeadline      DateTime
+  pickupCode          String    // 4-digit code e.g. "7104"
+  pickupInstructions  String?
+  shelterDelivered    String?   // Delivery destination e.g. "Asha Kiran Night Shelter"
+  fssaiVerified       Boolean   @default(true)
+  status              String    @default("ready_for_pickup") // "ready_for_pickup", "completed", "cancelled"
+  completedAt         DateTime?
+  listingId           Int
+  listing             Listing   @relation(fields: [listingId], references: [id])
+  ngoId               Int
+  ngo                 NGO       @relation(fields: [ngoId], references: [id])
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+}
+
+model FeedPost {
+  id            Int         @id @default(autoincrement())
+  content       String
+  imageUrl      String?
+  postType      String      // TEXT, IMAGE, EVENT, OFFER, etc.
+  latitude      Float?
+  longitude     Float?
+  authorId      Int
+  author        User        @relation(fields: [authorId], references: [id])
+  restaurantId  Int?
+  restaurant    Restaurant? @relation(fields: [restaurantId], references: [id])
+  ngoId         Int?
+  ngo           NGO?        @relation(fields: [ngoId], references: [id])
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+}
+
+model Notification {
+  id            Int         @id @default(autoincrement())
+  title         String
+  body          String
+  data          Json?
+  isRead        Boolean     @default(false)
+  userId        Int
+  user          User        @relation(fields: [userId], references: [id])
+  createdAt     DateTime    @default(now())
+}
