@@ -28,22 +28,28 @@ model User {
 }
 
 model Restaurant {
-  id            Int          @id @default(autoincrement())
-  name          String
-  address       String?
-  phone         String?
-  fssaiNumber   String?
-  latitude      Float
-  longitude     Float
-  cuisineType   String?
-  rating        Float        @default(0.0)
-  isActive      Boolean      @default(true)
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
-  ownerId       Int
-  owner         User         @relation(fields: [ownerId], references: [id])
-  feedPosts     FeedPost[]
-  listings      Listing[]
+  id                    Int          @id @default(autoincrement())
+  name                  String
+  address               String?
+  phone                 String?
+  fssaiNumber           String?
+  latitude              Float
+  longitude             Float
+  cuisineType           String?
+  rating                Float        @default(0.0)
+  approvalStatus        String       @default("APPROVED") // "PENDING", "APPROVED", "REJECTED", "SUSPENDED"
+  karmaScore            Int          @default(100)
+  warningCount          Int          @default(0)
+  strikeCount           Int          @default(0)
+  totalMealsDonated     Int          @default(0)
+  foodWastePreventedKg  Float        @default(0.0)
+  isActive              Boolean      @default(true)
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+  ownerId               Int
+  owner                 User         @relation(fields: [ownerId], references: [id])
+  feedPosts             FeedPost[]
+  listings              Listing[]
 }
 
 model NGO {
@@ -60,6 +66,10 @@ model NGO {
   operatingBase           String?       @default("Main Logistics Depot")
   defaultRadiusKm         Float         @default(8.0)
   pickupMode              String        @default("NGO Representative Self-Pickup")
+  approvalStatus          String        @default("APPROVED") // "PENDING", "APPROVED", "REJECTED", "SUSPENDED"
+  karmaScore              Int           @default(100)
+  warningCount            Int           @default(0)
+  strikeCount             Int           @default(0)
   isActive                Boolean       @default(true)
   isVerified              Boolean       @default(true)
   
@@ -80,7 +90,11 @@ model NGO {
 model Listing {
   id                  Int           @id @default(autoincrement())
   foodName            String
-  category            String        // "Cooked Food", "Bakery", "Fresh Produce", etc.
+  category            String        // "Cooked Food", "Bakery", "Fresh Produce", "Raw Ingredients", etc.
+  itemType            String        @default("COOKED_MEAL") // "COOKED_MEAL", "RAW_INGREDIENT", "BAKERY", "PRODUCE", "PACKAGED"
+  quantityUnit        String        @default("servings") // "servings", "kg", "packets", "crates"
+  pickupWindowStart   DateTime?
+  pickupWindowEnd     DateTime?
   totalServings       Int
   availableServings   Int
   preparedTime        String
@@ -90,8 +104,9 @@ model Listing {
   isVeg               Boolean       @default(true)
   dietary             String[]      @default([]) // ["Pure Veg", "Halal", "Contains Dairy", etc.]
   storageInstructions String?
+  notes               String?
   imageUrl            String?
-  status              String        @default("ACTIVE") // "ACTIVE", "PARTIALLY_RESERVED", "FULLY_RESERVED", "EXPIRED", "COMPLETED"
+  status              String        @default("ACTIVE") // "ACTIVE", "PARTIALLY_RESERVED", "FULLY_RESERVED", "EXPIRED", "CANCELLED", "COMPLETED"
   restaurantId        Int
   restaurant          Restaurant    @relation(fields: [restaurantId], references: [id])
   reservations        Reservation[]
@@ -109,6 +124,11 @@ model Reservation {
   shelterDelivered    String?   // Delivery destination e.g. "Asha Kiran Night Shelter"
   fssaiVerified       Boolean   @default(true)
   status              String    @default("ready_for_pickup") // "ready_for_pickup", "completed", "cancelled"
+  cancellationReason  String?
+  cancelledAt         DateTime?
+  cancelledByRole     String?   // "NGO", "RESTAURANT", "SYSTEM"
+  handoverVerifiedAt  DateTime?
+  handoverVerifiedBy  Int?
   completedAt         DateTime?
   listingId           Int
   listing             Listing   @relation(fields: [listingId], references: [id])
@@ -143,5 +163,30 @@ model Notification {
   isRead        Boolean     @default(false)
   userId        Int
   user          User        @relation(fields: [userId], references: [id])
+  createdAt     DateTime    @default(now())
+}
+
+model KarmaLog {
+  id            Int         @id @default(autoincrement())
+  entityType    String      // "NGO" | "RESTAURANT"
+  entityId      Int
+  pointsDelta   Int         // e.g. +10, -15
+  action        String      // "ON_TIME_COLLECTION", "LATE_CANCELLATION", "NO_SHOW", "SUCCESSFUL_DONATION", "QUALITY_DISCREPANCY"
+  reason        String?
+  reservationId Int?
+  listingId     Int?
+  createdAt     DateTime    @default(now())
+}
+
+model Report {
+  id            Int         @id @default(autoincrement())
+  reporterType  String      // "NGO" | "RESTAURANT"
+  reporterId    Int
+  targetType    String      // "NGO" | "RESTAURANT"
+  targetId      Int
+  reservationId Int?
+  reason        String
+  details       String?
+  status        String      @default("PENDING") // "PENDING", "RESOLVED", "DISMISSED"
   createdAt     DateTime    @default(now())
 }
