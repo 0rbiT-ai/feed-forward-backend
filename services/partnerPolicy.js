@@ -57,7 +57,11 @@ const getTrustLevel = (karmaScore, strikeCount) => {
 
 const applyKarmaChange = ({ karmaScore, strikeCount, pointsDelta, action }) => {
   const nextKarma = Math.max(0, Number(karmaScore || 0) + Number(pointsDelta || 0));
-  const nextStrikeCount = pointsDelta < 0 && nextKarma < 50 ? Number(strikeCount || 0) + 1 : Number(strikeCount || 0);
+  let nextStrikeCount = Math.max(0, Number(strikeCount || 0));
+  if (pointsDelta < 0 && nextKarma < 50) nextStrikeCount += 1;
+  if (['ON_TIME_COLLECTION', 'SUCCESSFUL_DONATION'].includes(action) && pointsDelta > 0) {
+    nextStrikeCount = Math.max(0, nextStrikeCount - 1);
+  }
   return {
     karmaScore: nextKarma,
     strikeCount: nextStrikeCount,

@@ -11,6 +11,8 @@ model User {
   email                   String    @unique
   phone                   String?   @unique
   password                String
+  googleSub               String?   @unique
+  googleEmail             String?
   name                    String?
   role                    String    @default("NGO") // "NGO" | "RESTAURANT" | "ADMIN"
   isVerified              Boolean   @default(false)
@@ -42,14 +44,14 @@ model Restaurant {
   longitude            Float
   cuisineType          String?
   rating               Float      @default(0.0)
-  approvalStatus       String     @default("APPROVED") // "PENDING", "APPROVED", "REJECTED", "SUSPENDED"
+  approvalStatus       String     @default("PENDING") // "PENDING", "APPROVED", "REJECTED", "SUSPENDED"
   approvalReason       String?
   approvalReviewAt     DateTime?
   approvedById         Int?
   documentName         String?
   documentUrl          String?
   documentStatus       String     @default("NOT_SUBMITTED") // "NOT_SUBMITTED", "PENDING_REVIEW", "APPROVED", "REJECTED"
-  karmaScore           Int        @default(100)
+  karmaScore           Int        @default(0)
   warningCount         Int        @default(0)
   strikeCount          Int        @default(0)
   totalMealsDonated    Int        @default(0)
@@ -77,18 +79,18 @@ model NGO {
   operatingBase   String? @default("Main Logistics Depot")
   defaultRadiusKm Float   @default(8.0)
   pickupMode      String  @default("NGO Representative Self-Pickup")
-  approvalStatus  String  @default("APPROVED") // "PENDING", "APPROVED", "REJECTED", "SUSPENDED"
+  approvalStatus  String  @default("PENDING") // "PENDING", "APPROVED", "REJECTED", "SUSPENDED"
   approvalReason  String?
   approvalReviewAt DateTime?
   approvedById    Int?
   documentName    String?
   documentUrl     String?
   documentStatus  String  @default("NOT_SUBMITTED") // "NOT_SUBMITTED", "PENDING_REVIEW", "APPROVED", "REJECTED"
-  karmaScore      Int     @default(100)
+  karmaScore      Int     @default(0)
   warningCount    Int     @default(0)
   strikeCount     Int     @default(0)
   isActive        Boolean @default(true)
-  isVerified      Boolean @default(true)
+  isVerified      Boolean @default(false)
 
   // Impact metrics
   totalMealsRescued    Int   @default(0)

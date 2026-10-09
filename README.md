@@ -59,9 +59,18 @@ This is the backend for the Feed-forward application, built with Node.js, Expres
    GOOGLE_OAUTH_CLIENT_SECRET="your_google_client_secret"
    GOOGLE_OAUTH_CALLBACK_URL="http://localhost:5003/auth/google/callback"
 
-   # Gmail API for OTP email delivery
-   GMAIL_USER="your-gmail-address@gmail.com"
-   GMAIL_REFRESH_TOKEN="your-gmail-oauth-refresh-token"
+   # Cloudinary signed uploads for restaurant listing photos
+   CLOUDINARY_CLOUD_NAME="your_cloud_name"
+   CLOUDINARY_API_KEY="your_api_key"
+   CLOUDINARY_API_SECRET="your_api_secret"
+
+   # Gmail SMTP for OTP email delivery (use a Google App Password, not an API key)
+   SMTP_HOST="smtp.gmail.com"
+   SMTP_PORT="465"
+   SMTP_SECURE="true"
+   SMTP_USER="your-gmail-address@gmail.com"
+   SMTP_PASS="your-16-character-google-app-password"
+   SMTP_FROM="FeedForward <your-gmail-address@gmail.com>"
 
    # Frontend URL (for CORS and redirect)
    FRONTEND_URL="http://localhost:3000"
@@ -71,15 +80,14 @@ This is the backend for the Feed-forward application, built with Node.js, Expres
    FCM Admin is initialized when `FCM_SERVICE_ACCOUNT` is set; push delivery still requires
    registering device tokens and calling the Firebase Admin messaging API from a notification route.
 
-### Gmail API OTP setup
+### Gmail SMTP OTP setup
 
-1. In Google Cloud Console, enable **Gmail API** for the project used by the OAuth client.
-2. Add `https://developers.google.com/oauthplayground` as an authorized redirect URI on the Web OAuth client.
-3. Open [Google OAuth Playground](https://developers.google.com/oauthplayground), open its settings, enable **Use your own OAuth credentials**, and enter the Web client ID and secret.
-4. Authorize the scope `https://www.googleapis.com/auth/gmail.send`, exchange the code, and copy the refresh token.
-5. Set `GMAIL_USER` to the same Gmail account that granted consent and set `GMAIL_REFRESH_TOKEN` in `.env`.
+1. Enable 2-Step Verification on the Gmail account.
+2. Create a Google **App Password** for FeedForward.
+3. Set `SMTP_USER` to that Gmail address and `SMTP_PASS` to the generated 16-character App Password. Keep it in `.env`; do not commit or share it.
+4. The defaults above use Gmail's SMTP server over implicit TLS on port 465. For port 587, set `SMTP_PORT="587"` and `SMTP_SECURE="false"`.
 
-The backend uses Gmail API OAuth2 for email OTPs. Phone OTPs still use Twilio when its variables are configured; otherwise development OTPs are printed in the backend log.
+Gmail SMTP uses an App Password here; Google Cloud API keys and OAuth client ID/secret are not SMTP passwords. Google OAuth sign-in continues to use the separate `GOOGLE_OAUTH_*` settings. Phone OTPs still use Twilio when its variables are configured; otherwise development OTPs are printed in the backend log.
 
 3. Set up the database:
    - Ensure PostgreSQL is running and the `feedforward` database exists.

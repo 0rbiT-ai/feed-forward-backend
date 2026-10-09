@@ -23,8 +23,40 @@ const { createOtpSession, validateOtpAttempt, MAX_ATTEMPTS } = require('./servic
 const { sendPushNotification } = require('./services/notificationService');
 const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
+const nodemailer = require('nodemailer');
 const twilio = require('twilio');
+const cloudinary = require('cloudinary').v2;
 require('dotenv').config();
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
+
+const getCloudinaryListingPublicId = (imageUrl) => {
+  try {
+    const parsed = new URL(imageUrl);
+    if (parsed.hostname !== 'res.cloudinary.com') return null;
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    const uploadIndex = segments.indexOf('upload');
+    if (uploadIndex === -1) return null;
+    const assetSegments = segments.slice(uploadIndex + 1);
+    if (/^v\d+$/.test(assetSegments[0] || '')) assetSegments.shift();
+    if (!assetSegments.length) return null;
+    const fileName = assetSegments.pop().replace(/\.[^.]+$/, '');
+    const publicId = [...assetSegments, fileName].join('/');
+    return publicId.startsWith('feedforward/listings/') ? publicId : null;
+  } catch {
+    return null;
+  }
+};
+
+const deleteCloudinaryListingImage = async (imageUrl) => {
+  const publicId = getCloudinaryListingPublicId(imageUrl);
+  if (!publicId) return { skipped: true };
+  return cloudinary.uploader.destroy(publicId, { resource_type: 'image', invalidate: true });
+};
 
 // Initialize Express app
 const app = express();
@@ -63,6 +95,14 @@ try {
   console.warn('Prisma initialization fallback without adapter:', err.message);
   prisma = new PrismaClient();
 }
+
+const syncListingIdSequence = async () => prisma.$queryRawUnsafe(`
+  SELECT setval(
+    pg_get_serial_sequence('"Listing"', 'id'),
+    COALESCE((SELECT MAX(id) FROM "Listing"), 1),
+    EXISTS(SELECT 1 FROM "Listing")
+  )
+`);
 
 // Redis client (optional with in-memory fallbacks)
 let redisClient = null;
@@ -158,6 +198,24 @@ const otpStoreSet = async (key, value, expireSeconds = 300) => {
   otpStore.set(key, { value, expiry: Date.now() + (expireSeconds * 1000) });
 };
 
+const otpStoreConsume = async (key) => {
+  if (redisIsConnected && redisClient) {
+    try {
+      const cached = typeof redisClient.getDel === 'function'
+        ? await redisClient.getDel(key)
+        : await redisClient.get(key);
+      if (cached && typeof redisClient.getDel !== 'function') await redisClient.del(key);
+      return cached ? JSON.parse(cached) : null;
+    } catch {
+      return null;
+    }
+  }
+  const entry = otpStore.get(key);
+  otpStore.delete(key);
+  if (!entry || entry.expiry < Date.now()) return null;
+  return entry.value;
+};
+
 const maskEmail = (email) => {
   const [name, domain] = email.split('@');
   return `${name.slice(0, 2)}***@${domain}`;
@@ -165,16 +223,25 @@ const maskEmail = (email) => {
 
 const maskPhone = (phone) => `***${String(phone).slice(-4)}`;
 
-const gmailOAuthClient = process.env.GOOGLE_OAUTH_CLIENT_ID && process.env.GOOGLE_OAUTH_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN
-  ? new google.auth.OAuth2(
-      process.env.GOOGLE_OAUTH_CLIENT_ID,
-      process.env.GOOGLE_OAUTH_CLIENT_SECRET,
-      process.env.GOOGLE_OAUTH_CALLBACK_URL
-    )
+const smtpHost = process.env.SMTP_HOST;
+const smtpUser = process.env.SMTP_USER;
+const smtpPass = process.env.SMTP_PASS?.replace(/\s+/g, '');
+const smtpPort = Number(process.env.SMTP_PORT || 465);
+const smtpTransport = smtpHost && smtpUser && smtpPass &&
+  !/your[-_ ]|placeholder|replace[-_ ]/i.test(`${smtpUser} ${smtpPass}`)
+  ? nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: process.env.SMTP_SECURE ? process.env.SMTP_SECURE.toLowerCase() === 'true' : smtpPort === 465,
+      auth: { user: smtpUser, pass: smtpPass },
+    })
   : null;
-
-if (gmailOAuthClient) gmailOAuthClient.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
-const gmailApi = gmailOAuthClient ? google.gmail({ version: 'v1', auth: gmailOAuthClient }) : null;
+const smtpFromSetting = process.env.SMTP_FROM && !/your[-_ ]|placeholder|replace[-_ ]/i.test(process.env.SMTP_FROM)
+  ? process.env.SMTP_FROM
+  : smtpUser;
+const smtpFrom = !smtpFromSetting || smtpFromSetting.includes('@')
+  ? smtpFromSetting
+  : { name: smtpFromSetting, address: smtpUser };
 
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -182,24 +249,18 @@ const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_T
 
 const deliverOtp = async (channel, destination, code, purpose) => {
   const message = `Your FeedForward ${purpose} code is ${code}. It expires in 10 minutes.`;
-  if (channel === 'email' && gmailApi && process.env.GMAIL_USER) {
+  if (channel === 'email' && smtpTransport) {
     try {
-      const rawMessage = [
-        `From: ${process.env.GMAIL_USER}`,
-        `To: ${destination}`,
-        `Subject: FeedForward ${purpose} code`,
-        'Content-Type: text/plain; charset="UTF-8"',
-        '',
-        message
-      ].join('\r\n');
-      await gmailApi.users.messages.send({
-        userId: 'me',
-        requestBody: { raw: Buffer.from(rawMessage).toString('base64url') }
+      await smtpTransport.sendMail({
+        from: smtpFrom,
+        to: destination,
+        subject: `FeedForward ${purpose} code`,
+        text: message,
       });
       console.log(`[AUTH-OTP][EMAIL-SENT] Sent OTP to ${destination}`);
       return;
     } catch (emailErr) {
-      console.warn(`[AUTH-OTP][EMAIL-WARN] Failed to send via Gmail API: ${emailErr.message}. Falling back to console.`);
+      console.warn(`[AUTH-OTP][EMAIL-WARN] Failed to send via SMTP: ${emailErr.message}. Falling back to console.`);
     }
   }
   if (channel === 'phone' && twilioClient && process.env.TWILIO_FROM) {
@@ -249,10 +310,21 @@ const googleMobileRedirect = 'feedforward://auth/google';
 
 const getGoogleRedirectUri = (value) => {
   if (!value) return googleMobileRedirect;
-  if (value !== googleMobileRedirect) {
+  if (value === googleMobileRedirect) return value;
+  let redirect;
+  try {
+    redirect = new URL(value);
+  } catch {
     throw new Error('Unsupported Google OAuth redirect URI');
   }
-  return value;
+  const configuredOrigins = (process.env.GOOGLE_OAUTH_WEB_ALLOWED_ORIGINS || '')
+    .split(',').map((origin) => origin.trim()).filter(Boolean);
+  const isLocalDevelopmentOrigin = ['localhost', '127.0.0.1'].includes(redirect.hostname) && ['http:', 'https:'].includes(redirect.protocol);
+  const isConfiguredOrigin = configuredOrigins.includes(redirect.origin);
+  if (!['http:', 'https:'].includes(redirect.protocol) || redirect.pathname !== '/auth/google-callback' || redirect.hash || redirect.username || redirect.password || (!isLocalDevelopmentOrigin && !isConfiguredOrigin)) {
+    throw new Error('Unsupported Google OAuth redirect URI');
+  }
+  return redirect.toString();
 };
 
 // Firebase Admin (optional)
@@ -496,19 +568,31 @@ app.post('/auth/register', async (req, res) => {
       taxExemption,
       mission,
       fssaiNumber,
-      cuisineType
+      cuisineType,
+      googleRegistrationToken
     } = req.body;
     if (!email || !phone || !password) {
       return res.status(400).json({ message: 'Email, phone number, and password are required' });
     }
 
-    const existingUser = await prisma.user.findUnique({ where: { email } });
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const googleIdentity = googleRegistrationToken
+      ? await otpStoreConsume(`google-registration:${googleRegistrationToken}`)
+      : null;
+    if (googleRegistrationToken && (!googleIdentity || googleIdentity.email !== normalizedEmail)) {
+      return res.status(400).json({ message: 'Google registration link expired or did not match this email. Link Google again or continue without it.' });
+    }
+    const existingUser = await prisma.user.findUnique({ where: { email: normalizedEmail } });
     if (existingUser) {
       return res.status(400).json({ message: 'User with this email already exists' });
     }
     const existingPhone = await prisma.user.findUnique({ where: { phone } });
     if (existingPhone) {
       return res.status(400).json({ message: 'User with this phone number already exists' });
+    }
+    if (googleIdentity?.sub) {
+      const linkedGoogleAccount = await prisma.user.findUnique({ where: { googleSub: googleIdentity.sub } });
+      if (linkedGoogleAccount) return res.status(409).json({ message: 'This Google account is already linked to a FeedForward account.' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -522,11 +606,13 @@ app.post('/auth/register', async (req, res) => {
 
     const user = await prisma.user.create({
       data: {
-        email,
+        email: normalizedEmail,
         phone,
         password: hashedPassword,
         name: name || email.split('@')[0],
         role: assignedRole,
+        googleSub: googleIdentity?.sub || null,
+        googleEmail: googleIdentity?.email || null,
         isVerified: false,
         emailVerificationSentAt: new Date()
       }
@@ -537,15 +623,15 @@ app.post('/auth/register', async (req, res) => {
       const ngo = await prisma.nGO.create({
         data: {
           name: name || `${email.split('@')[0]} Relief Org`,
-          address: address || "Koramangala Community Depot, Bengaluru",
+          address: address || '',
           latitude: lat,
           longitude: lng,
-          darpanId: darpanId || `KA/2026/${Math.floor(100000 + Math.random() * 900000)}`,
-          taxExemption: taxExemption || "Section 80G Certified",
-          mission: mission || "Rescuing surplus food for local communities",
+          darpanId: darpanId || '',
+          taxExemption: taxExemption || '',
+          mission: mission || '',
           phone,
           approvalStatus: 'PENDING',
-          karmaScore: 100,
+          karmaScore: 0,
           warningCount: 0,
           strikeCount: 0,
           ownerId: user.id
@@ -556,14 +642,14 @@ app.post('/auth/register', async (req, res) => {
       const restaurant = await prisma.restaurant.create({
         data: {
           name: name || `${email.split('@')[0]} Kitchen`,
-          address: address || "Bengaluru Commercial District",
+          address: address || '',
           latitude: lat,
           longitude: lng,
-          fssaiNumber: fssaiNumber || `112233${Math.floor(100000 + Math.random() * 900000)}`,
-          cuisineType: cuisineType || "Multi-Cuisine",
+          fssaiNumber: fssaiNumber || '',
+          cuisineType: cuisineType || '',
           phone,
           approvalStatus: 'PENDING',
-          karmaScore: 100,
+          karmaScore: 0,
           warningCount: 0,
           strikeCount: 0,
           ownerId: user.id
@@ -792,7 +878,17 @@ app.post('/auth/legacy/verify-otp', async (req, res) => {
   return res.status(410).json({ message: 'Passwordless OTP login has been removed. Use password sign-in with verification.' });
 });
 
-// Google OAuth for the mobile app
+const buildGoogleAuthorizationUrl = (purpose, redirectUri, userId = null) => {
+  const state = jwt.sign({ purpose, userId, redirectUri }, jwtSecret, { expiresIn: '10m', algorithm: 'HS256' });
+  return googleOAuthClient.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'select_account',
+    scope: ['openid', 'email', 'profile'],
+    state,
+  });
+};
+
+// Google sign-in only authenticates Google identities explicitly linked to FeedForward.
 app.get('/auth/google', (req, res) => {
   if (!googleOAuthClient) {
     return res.status(503).json({ message: 'Google OAuth is not configured' });
@@ -800,14 +896,18 @@ app.get('/auth/google', (req, res) => {
 
   try {
     const redirectUri = getGoogleRedirectUri(req.query.redirect_uri);
-    const state = jwt.sign({ redirectUri }, jwtSecret, { expiresIn: '10m', algorithm: 'HS256' });
-    const authorizationUrl = googleOAuthClient.generateAuthUrl({
-      access_type: 'offline',
-      prompt: 'select_account',
-      scope: ['openid', 'email', 'profile'],
-      state
-    });
-    res.redirect(authorizationUrl);
+    const purpose = req.query.purpose === 'register' ? 'register' : 'sign-in';
+    res.redirect(buildGoogleAuthorizationUrl(purpose, redirectUri));
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
+
+app.post('/auth/google/link-session', authenticateJWT, (req, res) => {
+  if (!googleOAuthClient) return res.status(503).json({ message: 'Google OAuth is not configured' });
+  try {
+    const redirectUri = getGoogleRedirectUri(req.body.redirectUri);
+    res.json({ authorizationUrl: buildGoogleAuthorizationUrl('link', redirectUri, req.user.userId) });
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -820,10 +920,14 @@ app.get('/auth/google/callback', async (req, res) => {
 
   try {
     const { code, state, error } = req.query;
-    if (error) return res.status(400).send(`Google sign-in failed: ${error}`);
-    if (!code || !state) return res.status(400).send('Google OAuth code or state is missing');
+    if (!state) return res.status(400).send('Google OAuth state is missing');
 
     const statePayload = jwt.verify(state, jwtSecret, { algorithms: ['HS256'] });
+    const redirectUrl = new URL(statePayload.redirectUri);
+    if (error || !code) {
+      redirectUrl.searchParams.set('error', error || 'google_code_missing');
+      return res.redirect(redirectUrl.toString());
+    }
     const { tokens } = await googleOAuthClient.getToken(code);
     googleOAuthClient.setCredentials(tokens);
     const userInfoResponse = await googleOAuthClient.request({ url: 'https://openidconnect.googleapis.com/v1/userinfo' });
@@ -833,40 +937,69 @@ app.get('/auth/google/callback', async (req, res) => {
       return res.status(400).send('A verified Google email address is required');
     }
 
-    let user = await prisma.user.findUnique({
-      where: { email: googleUser.email },
-      include: { ngos: true, restaurants: true }
-    });
+    if (!googleUser.sub) return res.status(400).send('Google did not return an account identifier');
 
-    if (!user) {
-      const name = googleUser.name || googleUser.email.split('@')[0];
-      const password = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
-      user = await prisma.user.create({
-        data: {
-          email: googleUser.email,
-          name,
-          password,
-          role: 'NGO',
-          isVerified: true,
-          ngos: {
-            create: {
-              name: `${name} Relief Org`,
-              latitude: 12.9352,
-              longitude: 77.6245,
-              darpanId: `KA/2026/${Math.floor(100000 + Math.random() * 900000)}`,
-              taxExemption: 'Section 80G Certified'
-            }
-          }
-        },
-        include: { ngos: true, restaurants: true }
+    if (statePayload.purpose === 'register') {
+      const existing = await prisma.user.findFirst({
+        where: { OR: [{ googleSub: googleUser.sub }, { email: googleUser.email.toLowerCase() }] },
+        select: { id: true },
       });
+      if (existing) {
+        redirectUrl.searchParams.set('error', 'google_account_already_exists');
+        return res.redirect(redirectUrl.toString());
+      }
+      const registrationToken = crypto.randomBytes(24).toString('hex');
+      await otpStoreSet(`google-registration:${registrationToken}`, {
+        sub: googleUser.sub,
+        email: googleUser.email.toLowerCase(),
+        name: googleUser.name || '',
+      }, 600);
+      redirectUrl.searchParams.set('registrationToken', registrationToken);
+      redirectUrl.searchParams.set('googleEmail', googleUser.email.toLowerCase());
+      return res.redirect(redirectUrl.toString());
+    }
+
+    if (statePayload.purpose === 'link') {
+      const account = await prisma.user.findUnique({ where: { id: statePayload.userId }, select: { id: true, email: true } });
+      if (!account) {
+        redirectUrl.searchParams.set('error', 'feedforward_account_not_found');
+        return res.redirect(redirectUrl.toString());
+      }
+      if (account.email.toLowerCase() !== googleUser.email.toLowerCase()) {
+        redirectUrl.searchParams.set('error', 'google_email_mismatch');
+        return res.redirect(redirectUrl.toString());
+      }
+      const linkedUser = await prisma.user.findUnique({ where: { googleSub: googleUser.sub }, select: { id: true } });
+      if (linkedUser && linkedUser.id !== statePayload.userId) {
+        redirectUrl.searchParams.set('error', 'google_account_already_linked');
+        return res.redirect(redirectUrl.toString());
+      }
+      await prisma.user.update({
+        where: { id: statePayload.userId },
+        data: { googleSub: googleUser.sub, googleEmail: googleUser.email.toLowerCase() },
+      });
+      redirectUrl.searchParams.set('linked', '1');
+      redirectUrl.searchParams.set('googleEmail', googleUser.email.toLowerCase());
+      return res.redirect(redirectUrl.toString());
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { googleSub: googleUser.sub },
+      include: { ngos: true, restaurants: true },
+    });
+    if (!user) {
+      redirectUrl.searchParams.set('error', 'google_account_not_linked');
+      return res.redirect(redirectUrl.toString());
+    }
+    if (!user.isVerified) {
+      redirectUrl.searchParams.set('error', 'feedforward_account_not_verified');
+      return res.redirect(redirectUrl.toString());
     }
 
     const accessToken = generateAccessToken(user);
     const refreshToken = generateRefreshToken(user);
     setAuthCookies(res, accessToken, refreshToken);
 
-    const redirectUrl = new URL(statePayload.redirectUri);
     redirectUrl.searchParams.set('accessToken', accessToken);
     redirectUrl.searchParams.set('refreshToken', refreshToken);
     redirectUrl.searchParams.set('name', user.name || '');
@@ -999,6 +1132,54 @@ app.post('/auth/logout', async (req, res) => {
 // ------------------------------------------
 // SURPLUS LISTINGS & NGO DISCOVER FEED
 // ------------------------------------------
+
+// Create short-lived signed upload parameters so Cloudinary secrets never reach
+// the mobile or web client. Images are uploaded directly from the client.
+app.post('/api/uploads/cloudinary-signature', authenticateJWT, requireRole('RESTAURANT'), async (req, res) => {
+  try {
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+    const apiKey = process.env.CLOUDINARY_API_KEY;
+    const apiSecret = process.env.CLOUDINARY_API_SECRET;
+    if (!cloudName || !apiKey || !apiSecret) {
+      return res.status(503).json({ message: 'Cloudinary image uploads are not configured on the server.' });
+    }
+
+    const restaurant = await prisma.restaurant.findFirst({
+      where: { ownerId: req.user.userId },
+      select: { approvalStatus: true, isActive: true },
+    });
+    if (!restaurant || restaurant.approvalStatus !== 'APPROVED' || !restaurant.isActive) {
+      return res.status(403).json({ message: 'An approved, active restaurant account is required to upload listing photos.' });
+    }
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const folder = `feedforward/listings/${req.user.userId}`;
+    const publicId = crypto.randomUUID();
+    const signature = cloudinary.utils.api_sign_request({ folder, public_id: publicId, timestamp }, apiSecret);
+    return res.json({ cloudName, apiKey, timestamp, folder, publicId, signature });
+  } catch (error) {
+    console.error('Cloudinary signature error:', error.message);
+    return res.status(500).json({ message: 'Could not prepare the image upload.' });
+  }
+});
+
+app.delete('/api/uploads/cloudinary-image', authenticateJWT, requireRole('RESTAURANT'), async (req, res) => {
+  try {
+    const { publicId } = req.body || {};
+    const ownerFolder = `feedforward/listings/${req.user.userId}/`;
+    if (typeof publicId !== 'string' || !publicId.startsWith(ownerFolder) || !/^[A-Za-z0-9_./-]+$/.test(publicId)) {
+      return res.status(400).json({ message: 'A valid listing image ID is required.' });
+    }
+    const result = await cloudinary.uploader.destroy(publicId, { resource_type: 'image', invalidate: true });
+    if (result.result !== 'ok' && result.result !== 'not found') {
+      return res.status(502).json({ message: 'Cloudinary could not remove the unused listing image.' });
+    }
+    return res.json({ message: 'Listing image removed.', result: result.result });
+  } catch (error) {
+    console.error('Cloudinary image cleanup error:', error.message);
+    return res.status(502).json({ message: 'Cloudinary could not remove the unused listing image.' });
+  }
+});
 
 // GET /api/listings
 // Returns real database active surplus listings with proximity calculation, search, category, dietary, and radius filtering.
@@ -1156,7 +1337,7 @@ app.get('/api/listings', async (req, res) => {
         distanceMeters,
         restaurant: item.restaurant?.name || "Restaurant Partner",
         restaurantId: item.restaurant?.id,
-        restaurantKarma: item.restaurant?.karmaScore || 100,
+        restaurantKarma: item.restaurant?.karmaScore ?? 0,
         address: item.restaurant?.address || "Bengaluru",
         contactPhone: item.restaurant?.phone || null,
         fssaiNumber: item.restaurant?.fssaiNumber || null
@@ -1211,8 +1392,11 @@ app.post('/api/listings', authenticateJWT, requireRole('RESTAURANT'), async (req
     if (!foodName?.trim() || !Number.isInteger(count) || count <= 0 || count > 10000) {
       return res.status(400).json({ message: 'foodName and a valid totalServings value are required' });
     }
-    if (!Number.isFinite(safeUntilHoursValue) || safeUntilHoursValue <= 0 || safeUntilHoursValue > 168) {
-      return res.status(400).json({ message: 'safeUntilHours must be between 1 and 168 hours' });
+    if (typeof imageUrl !== 'string' || !imageUrl.trim()) {
+      return res.status(400).json({ message: 'An item photo is required to post a listing.' });
+    }
+    if (!Number.isInteger(safeUntilHoursValue) || safeUntilHoursValue < 1 || safeUntilHoursValue > 168) {
+      return res.status(400).json({ message: 'safeUntilHours must be a whole number between 1 and 168 hours' });
     }
 
     const restaurant = await prisma.restaurant.findFirst({
@@ -1231,7 +1415,7 @@ app.post('/api/listings', authenticateJWT, requireRole('RESTAURANT'), async (req
 
     const safeUntilDate = new Date(Date.now() + (safeUntilHoursValue * 3600 * 1000));
 
-    const listing = await prisma.listing.create({
+    const createListingInput = {
       data: {
         foodName,
         category,
@@ -1243,13 +1427,21 @@ app.post('/api/listings', authenticateJWT, requireRole('RESTAURANT'), async (req
         safeUntil: safeUntilDate,
         isVeg: Boolean(isVeg),
         dietary: Array.isArray(dietary) ? dietary : [dietary],
-        storageInstructions: storageInstructions || "Carry insulated thermal containers.",
+        storageInstructions: storageInstructions?.trim() || null,
         notes: notes || null,
-        imageUrl: imageUrl || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=800&auto=format&fit=crop&q=80",
+        imageUrl: imageUrl.trim(),
         restaurantId: restaurant.id
       },
       include: { restaurant: true }
-    });
+    };
+    let listing;
+    try {
+      listing = await prisma.listing.create(createListingInput);
+    } catch (createError) {
+      if (createError.code !== 'P2002') throw createError;
+      await syncListingIdSequence();
+      listing = await prisma.listing.create(createListingInput);
+    }
 
     // Update Redis Geo
     if (restaurant.latitude && restaurant.longitude) {
@@ -1741,6 +1933,25 @@ app.post('/api/restaurant/reservations/verify-otp', authenticateJWT, requireRole
       return updatedReservation;
     });
 
+    // Keep the listing row for reservation/history relations, but drop its photo
+    // after its final reserved portions have actually been handed over.
+    const exhaustedListing = await prisma.listing.findUnique({
+      where: { id: reservation.listingId },
+      select: {
+        availableServings: true,
+        imageUrl: true,
+        reservations: { where: { status: 'ready_for_pickup' }, select: { id: true }, take: 1 },
+      },
+    });
+    if (exhaustedListing?.availableServings === 0 && exhaustedListing.reservations.length === 0) {
+      try {
+        if (exhaustedListing.imageUrl) await deleteCloudinaryListingImage(exhaustedListing.imageUrl);
+        await prisma.listing.update({ where: { id: reservation.listingId }, data: { imageUrl: null, status: 'COMPLETED' } });
+      } catch (imageCleanupError) {
+        console.error('Could not remove exhausted listing image:', imageCleanupError);
+      }
+    }
+
     // Real-time broadcast
     io.emit('pickup_completed', {
       reservationId: reservation.id,
@@ -1828,7 +2039,11 @@ app.get('/api/restaurant/listings', authenticateJWT, requireRole('RESTAURANT'), 
     }
 
     const listings = await prisma.listing.findMany({
-      where: { restaurantId: restaurant.id },
+      where: {
+        restaurantId: restaurant.id,
+        availableServings: { gt: 0 },
+        status: { in: ['ACTIVE', 'PARTIALLY_RESERVED'] },
+      },
       include: {
         reservations: {
           where: { status: 'ready_for_pickup' }
@@ -1866,6 +2081,12 @@ app.patch('/api/restaurant/listings/:id', authenticateJWT, requireRole('RESTAURA
     if (!listing) {
       return res.status(404).json({ message: 'Listing not found' });
     }
+    if (imageUrl !== undefined && (typeof imageUrl !== 'string' || !imageUrl.trim())) {
+      return res.status(400).json({ message: 'Item photo URL must be a non-empty string.' });
+    }
+    if (!(typeof imageUrl === 'string' && imageUrl.trim()) && !listing.imageUrl?.trim()) {
+      return res.status(400).json({ message: 'An item photo is required to keep this listing published.' });
+    }
 
     const updateData = {};
     if (status && ['ACTIVE', 'PARTIALLY_RESERVED', 'FULLY_RESERVED', 'CANCELLED'].includes(status)) {
@@ -1890,13 +2111,13 @@ app.patch('/api/restaurant/listings/:id', authenticateJWT, requireRole('RESTAURA
     if (category?.trim()) updateData.category = category.trim();
     if (itemType?.trim()) updateData.itemType = itemType.trim();
     if (dietary !== undefined) updateData.dietary = Array.isArray(dietary) ? dietary : [dietary];
-    if (storageInstructions?.trim()) updateData.storageInstructions = storageInstructions.trim();
+    if (storageInstructions !== undefined) updateData.storageInstructions = storageInstructions?.trim() || null;
     if (notes !== undefined) updateData.notes = notes.trim() || null;
     if (imageUrl?.trim()) updateData.imageUrl = imageUrl.trim();
     if (safeUntilHours) {
       const parsedSafeUntilHours = parseFloat(safeUntilHours);
-      if (!Number.isFinite(parsedSafeUntilHours) || parsedSafeUntilHours <= 0 || parsedSafeUntilHours > 8760) {
-        return res.status(400).json({ message: 'Safe-until must be between 1 hour and 365 days.' });
+      if (!Number.isInteger(parsedSafeUntilHours) || parsedSafeUntilHours < 1 || parsedSafeUntilHours > 168) {
+        return res.status(400).json({ message: 'Safe-until must be a whole number between 1 and 168 hours.' });
       }
       updateData.safeUntil = new Date(Date.now() + parsedSafeUntilHours * 3600 * 1000);
     }
@@ -1905,6 +2126,14 @@ app.patch('/api/restaurant/listings/:id', authenticateJWT, requireRole('RESTAURA
       where: { id: listingId },
       data: updateData
     });
+
+    if (imageUrl?.trim() && listing.imageUrl && listing.imageUrl !== updated.imageUrl) {
+      try {
+        await deleteCloudinaryListingImage(listing.imageUrl);
+      } catch (cleanupError) {
+        console.warn('Could not remove replaced Cloudinary listing image:', cleanupError.message);
+      }
+    }
 
     io.emit('listing_updated', {
       listingId: updated.id,
@@ -1933,10 +2162,30 @@ app.delete('/api/restaurant/listings/:id', authenticateJWT, requireRole('RESTAUR
       }
     });
     if (!listing) return res.status(404).json({ message: 'Listing not found' });
-    if (listing.reservations.length > 0) {
-      return res.status(409).json({ message: 'Cannot delete a listing with active or completed reservations. Cancel or complete them first.' });
+    const hasPendingPickup = listing.reservations.some((reservation) => reservation.status === 'ready_for_pickup');
+    if (hasPendingPickup) {
+      return res.status(409).json({ message: 'This listing has an incoming pickup. Complete or cancel the pickup before removing it.' });
     }
-    await prisma.listing.delete({ where: { id: listingId } });
+    const hasCompletedHandover = listing.reservations.some((reservation) => reservation.status === 'completed');
+    if (hasCompletedHandover) {
+      // Preserve completed handovers for donation history while removing the listing from active use.
+      try {
+        await deleteCloudinaryListingImage(listing.imageUrl);
+      } catch (cleanupError) {
+        console.warn('Listing was archived, but its Cloudinary image could not be removed:', cleanupError.message);
+      }
+      await prisma.listing.update({
+        where: { id: listingId },
+        data: { status: 'CANCELLED', availableServings: 0, imageUrl: null },
+      });
+    } else {
+      await prisma.listing.delete({ where: { id: listingId } });
+      try {
+        await deleteCloudinaryListingImage(listing.imageUrl);
+      } catch (cleanupError) {
+        console.warn('Listing was deleted, but its Cloudinary image could not be removed:', cleanupError.message);
+      }
+    }
     io.emit('listing_deleted', { listingId });
     res.json({ message: 'Listing deleted successfully' });
   } catch (error) {
@@ -1978,7 +2227,7 @@ app.get('/api/restaurant/reservations', authenticateJWT, requireRole('RESTAURANT
       ngoName: r.ngo.name,
       ngoPhone: r.ngo.phone || null,
       ngoTagline: r.ngo.tagline,
-      ngoKarma: r.ngo.karmaScore || 100,
+      ngoKarma: r.ngo.karmaScore ?? 0,
       pickupDeadline: new Date(r.pickupDeadline).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       reservedAt: new Date(r.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       status: r.status
@@ -2054,7 +2303,7 @@ app.get('/api/restaurant/stats', authenticateJWT, requireRole('RESTAURANT'), asy
 
     res.json({
       name: restaurant.name,
-      karmaScore: restaurant.karmaScore || 100,
+      karmaScore: restaurant.karmaScore ?? 0,
       rating: restaurant.rating || 4.8,
       totalMealsDonated: restaurant.totalMealsDonated || 0,
       foodWastePreventedKg: restaurant.foodWastePreventedKg || 0,
@@ -2398,71 +2647,55 @@ app.get('/api/profile', authenticateJWT, async (req, res) => {
 
     if (user.role === 'NGO') {
       const ngo = user.ngos?.[0] || {
-        name: user.name || "Robin Hood Army — Bengaluru Core",
-        tagline: "Zero-fund volunteer collective serving surplus food to local communities",
-        darpanId: "KA/2021/0291884",
-        taxExemption: "Section 80G Certified",
-        isVerified: true,
-        latitude: 12.9352,
-        longitude: 77.6245,
-        operatingBase: "Koramangala Community Depot, Bengaluru",
-        defaultRadiusKm: 8,
-        pickupMode: "NGO Representative Self-Pickup",
-        approvalStatus: 'APPROVED',
-        karmaScore: 100,
-        warningCount: 0,
-        strikeCount: 0,
-        totalMealsRescued: 3420,
-        foodWastePreventedKg: 1710,
-        co2eAvoidedTonnes: 4.28,
-        activePartners: 28
+        name: user.name || 'NGO', karmaScore: 0, warningCount: 0,
+        strikeCount: 0, totalMealsRescued: 0, foodWastePreventedKg: 0,
+        co2eAvoidedTonnes: 0, activePartners: 0,
       };
 
       return res.json({
         id: user.id,
         email: user.email,
+        googleLinked: Boolean(user.googleSub),
+        googleEmail: user.googleEmail,
         phone: user.phone,
         role: 'NGO',
         name: ngo.name,
-        tagline: ngo.tagline || "Volunteer food rescue collective",
-        darpanId: ngo.darpanId || "KA/2026/019284",
-        taxExemption: ngo.taxExemption || "Section 80G Certified",
-        mission: ngo.mission || "Zero hunger through food rescue",
-        isVerified: ngo.isVerified ?? true,
-        approvalStatus: ngo.approvalStatus || 'APPROVED',
+        tagline: ngo.tagline || '',
+        darpanId: ngo.darpanId || '',
+        taxExemption: ngo.taxExemption || '',
+        mission: ngo.mission || '',
+        isVerified: ngo.isVerified ?? false,
+        approvalStatus: ngo.approvalStatus || 'PENDING',
         documentStatus: ngo.documentStatus || 'NOT_SUBMITTED',
         documentName: ngo.documentName,
         documentUrl: ngo.documentUrl,
         approvalReason: ngo.approvalReason,
         approvalReviewAt: ngo.approvalReviewAt,
-        karmaScore: ngo.karmaScore ?? 100,
+        karmaScore: ngo.karmaScore ?? 0,
         warningCount: ngo.warningCount || 0,
         strikeCount: ngo.strikeCount || 0,
         latitude: ngo.latitude,
         longitude: ngo.longitude,
-        address: ngo.address || "Bengaluru",
+        address: ngo.address || '',
         logisticsSetting: {
           mode: ngo.pickupMode || "NGO Representative Self-Pickup",
           inAppDeliveryNote: "In-App Delivery Fleet Integration coming in Phase 2 roadmap.",
-          defaultRadiusKm: ngo.defaultRadiusKm || 8,
-          operatingBase: ngo.operatingBase || "Koramangala Community Depot, Bengaluru"
+          defaultRadiusKm: ngo.defaultRadiusKm || 0,
+          operatingBase: ngo.operatingBase || ''
         },
         impactStats: {
           totalMealsRescued: ngo.totalMealsRescued || 0,
           foodWastePreventedKg: ngo.foodWastePreventedKg || 0,
           co2eAvoidedTonnes: ngo.co2eAvoidedTonnes || 0,
-          activeRestaurantPartners: ngo.activePartners || 12
+          activeRestaurantPartners: ngo.activePartners || 0
         }
       });
     } else {
       // Restaurant profile
       const restaurant = user.restaurants?.[0] || {
-        name: user.name || "Partner Kitchen",
-        latitude: 12.9352,
-        longitude: 77.6245,
-        address: "Bengaluru Central",
-        approvalStatus: 'APPROVED',
-        karmaScore: 100,
+        name: user.name || 'Restaurant',
+        approvalStatus: 'PENDING',
+        karmaScore: 0,
         totalMealsDonated: 0,
         foodWastePreventedKg: 0
       };
@@ -2470,6 +2703,8 @@ app.get('/api/profile', authenticateJWT, async (req, res) => {
       return res.json({
         id: user.id,
         email: user.email,
+        googleLinked: Boolean(user.googleSub),
+        googleEmail: user.googleEmail,
         phone: user.phone,
         name: restaurant.name,
         role: 'RESTAURANT',
@@ -2478,14 +2713,14 @@ app.get('/api/profile', authenticateJWT, async (req, res) => {
         address: restaurant.address,
         phone: restaurant.phone,
         fssaiNumber: restaurant.fssaiNumber,
-        cuisineType: restaurant.cuisineType || "Multi-Cuisine",
-        approvalStatus: restaurant.approvalStatus || 'APPROVED',
+        cuisineType: restaurant.cuisineType || '',
+        approvalStatus: restaurant.approvalStatus || 'PENDING',
         documentStatus: restaurant.documentStatus || 'NOT_SUBMITTED',
         documentName: restaurant.documentName,
         documentUrl: restaurant.documentUrl,
         approvalReason: restaurant.approvalReason,
         approvalReviewAt: restaurant.approvalReviewAt,
-        karmaScore: restaurant.karmaScore ?? 100,
+        karmaScore: restaurant.karmaScore ?? 0,
         warningCount: restaurant.warningCount || 0,
         strikeCount: restaurant.strikeCount || 0,
         impactStats: {
@@ -2497,6 +2732,18 @@ app.get('/api/profile', authenticateJWT, async (req, res) => {
   } catch (error) {
     console.error('Error fetching profile:', error);
     res.status(500).json({ message: 'Failed to fetch profile', error: error.message });
+  }
+});
+
+app.delete('/api/profile/google-link', authenticateJWT, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { googleSub: true } });
+    if (!user?.googleSub) return res.status(404).json({ message: 'No Google account is linked.' });
+    await prisma.user.update({ where: { id: req.user.userId }, data: { googleSub: null, googleEmail: null } });
+    res.json({ message: 'Google account unlinked successfully.' });
+  } catch (error) {
+    console.error('Google unlink error:', error);
+    res.status(500).json({ message: 'Could not unlink Google account.' });
   }
 });
 
