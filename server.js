@@ -9,6 +9,18 @@ const redis = require('redis');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const {
+  isActivePartner,
+  canReserveListing,
+  isLateCancellation,
+  getPartnerApprovalState,
+  applyKarmaChange,
+  LATE_CANCELLATION_PENALTY,
+  NO_SHOW_PENALTY,
+  STRIKE_LIMIT,
+} = require('./services/partnerPolicy');
+const { createOtpSession, validateOtpAttempt, MAX_ATTEMPTS } = require('./services/otpService');
+const { sendPushNotification } = require('./services/notificationService');
 const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
 const twilio = require('twilio');
@@ -58,6 +70,7 @@ let redisIsConnected = false;
 
 // In-memory store for OTP & fallbacks
 const otpStore = new Map();
+const otpAttempts = new Map();
 
 if (process.env.REDIS_URL) {
   redisClient = redis.createClient({
@@ -200,7 +213,6 @@ const deliverOtp = async (channel, destination, code, purpose) => {
   }
   console.log(`[AUTH-OTP][DEV][${channel}] ${destination}: ${code}`);
 };
-
 
 // Haversine distance calculation in meters (graceful fallback)
 const calculateHaversineDistance = (lat1, lon1, lat2, lon2) => {
@@ -442,79 +454,6 @@ const searchNearbyNGOs = async (latitude, longitude, radiusInMeters = 10000) => 
   }
 };
 
-// Mock Seed Data for Fallback when Database is Empty
-const defaultMockListings = [
-  {
-    id: 1,
-    foodName: "Chicken Dum Biryani & Mirchi Ka Salan",
-    category: "Cooked Food",
-    totalServings: 45,
-    availableServings: 30,
-    preparedTime: "7:30 PM",
-    safeUntil: new Date(Date.now() + 2.5 * 3600 * 1000),
-    remainingHoursText: "2h 30m left",
-    isUrgent: true,
-    isVeg: false,
-    dietary: ["Halal", "Contains Dairy"],
-    storageInstructions: "Hot cooked food. Carry insulated thermal crates.",
-    imageUrl: "https://images.unsplash.com/photo-1563379091339-03b21ab4a4f8?w=800&auto=format&fit=crop&q=80",
-    restaurant: {
-      id: 101,
-      name: "Royal Biryani House",
-      address: "88, 5th Cross, 60ft Road, Koramangala 5th Block, Bengaluru",
-      phone: "+91 80 4122 9011",
-      latitude: 12.9352,
-      longitude: 77.6245
-    }
-  },
-  {
-    id: 2,
-    foodName: "Ghee Podi Idli & Medu Vada with Sambar",
-    category: "Cooked Food",
-    totalServings: 60,
-    availableServings: 60,
-    preparedTime: "8:00 PM",
-    safeUntil: new Date(Date.now() + 3.5 * 3600 * 1000),
-    remainingHoursText: "3h 30m left",
-    isUrgent: false,
-    isVeg: true,
-    dietary: ["Pure Veg", "Jain Friendly"],
-    storageInstructions: "Keep warm. Bring food-grade stainless containers.",
-    imageUrl: "https://images.unsplash.com/photo-1589301760014-d929f3979dbc?w=800&auto=format&fit=crop&q=80",
-    restaurant: {
-      id: 102,
-      name: "The Rameshwaram Cafe",
-      address: "2984, 12th Main Rd, HAL 2nd Stage, Indiranagar, Bengaluru",
-      phone: "+91 80 2520 7744",
-      latitude: 12.9719,
-      longitude: 77.6412
-    }
-  },
-  {
-    id: 3,
-    foodName: "Sourdough Boules, Brioche & Baguettes",
-    category: "Bakery",
-    totalServings: 35,
-    availableServings: 25,
-    preparedTime: "5:30 PM",
-    safeUntil: new Date(Date.now() + 18 * 3600 * 1000),
-    remainingHoursText: "Next day safe",
-    isUrgent: false,
-    isVeg: true,
-    dietary: ["Pure Veg", "Contains Gluten"],
-    storageInstructions: "Dry ambient storage. Cardboard or cloth bags suitable.",
-    imageUrl: "https://images.unsplash.com/photo-1509440159596-0249088772ff?w=800&auto=format&fit=crop&q=80",
-    restaurant: {
-      id: 103,
-      name: "Sandoitchi Artisanal Bakery",
-      address: "411, 27th Main Rd, Sector 4, HSR Layout, Bengaluru",
-      phone: "+91 80 4390 1120",
-      latitude: 12.9121,
-      longitude: 77.6446
-    }
-  }
-];
-
 // Helper to calculate human distance string
 const formatDistance = (lat1, lon1, lat2, lon2) => {
   if (!lat1 || !lon1 || !lat2 || !lon2) return "1.5 km";
@@ -574,6 +513,12 @@ app.post('/auth/register', async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const assignedRole = role === "RESTAURANT" ? "RESTAURANT" : "NGO";
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      return res.status(400).json({ message: 'A valid latitude and longitude are required' });
+    }
 
     const user = await prisma.user.create({
       data: {
@@ -582,14 +527,12 @@ app.post('/auth/register', async (req, res) => {
         password: hashedPassword,
         name: name || email.split('@')[0],
         role: assignedRole,
-        isVerified: true
+        isVerified: false,
+        emailVerificationSentAt: new Date()
       }
     });
 
-    // Create associated profile entity
-    const lat = parseFloat(latitude) || 12.9352;
-    const lng = parseFloat(longitude) || 77.6245;
-
+    // Create the associated profile in PENDING state. No profile is ever auto-approved.
     if (assignedRole === "NGO") {
       const ngo = await prisma.nGO.create({
         data: {
@@ -601,8 +544,10 @@ app.post('/auth/register', async (req, res) => {
           taxExemption: taxExemption || "Section 80G Certified",
           mission: mission || "Rescuing surplus food for local communities",
           phone,
-          approvalStatus: 'APPROVED',
+          approvalStatus: 'PENDING',
           karmaScore: 100,
+          warningCount: 0,
+          strikeCount: 0,
           ownerId: user.id
         }
       });
@@ -617,23 +562,29 @@ app.post('/auth/register', async (req, res) => {
           fssaiNumber: fssaiNumber || `112233${Math.floor(100000 + Math.random() * 900000)}`,
           cuisineType: cuisineType || "Multi-Cuisine",
           phone,
-          approvalStatus: 'APPROVED',
+          approvalStatus: 'PENDING',
           karmaScore: 100,
+          warningCount: 0,
+          strikeCount: 0,
           ownerId: user.id
         }
       });
       await geoAddLocation('restaurants_geo', lng, lat, restaurant.id);
     }
 
-    const accessToken = generateAccessToken(user);
-    const refreshToken = generateRefreshToken(user);
-    setAuthCookies(res, accessToken, refreshToken);
+    const challengeId = crypto.randomUUID();
+    const otp = crypto.randomInt(100000, 999999).toString();
+    await otpStoreSet(`email-verify:${challengeId}`, { userId: user.id, otp }, 600);
+    await deliverOtp('email', email, otp, 'account verification');
 
     res.status(201).json({
-      message: 'Account created successfully',
-      user: { id: user.id, email: user.email, name: user.name, role: user.role },
-      accessToken,
-      refreshToken
+      message: 'Account created. Verify your email to activate it.',
+      requiresEmailVerification: true,
+      challengeId,
+      destination: maskEmail(email),
+      expiresIn: '10 minutes',
+      devOtp: process.env.NODE_ENV !== 'production' ? otp : undefined,
+      user: { id: user.id, email: user.email, name: user.name, role: user.role, isVerified: false }
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -641,10 +592,62 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
+app.post('/auth/verify-email', async (req, res) => {
+  try {
+    const { challengeId, otp } = req.body;
+    const challenge = await otpStoreGet(`email-verify:${challengeId}`);
+    if (!challenge || challenge.otp !== String(otp).trim()) {
+      return res.status(400).json({ message: 'Invalid or expired verification code' });
+    }
+
+    const user = await prisma.user.update({
+      where: { id: challenge.userId },
+      data: {
+        isVerified: true,
+        emailVerifiedAt: new Date(),
+        emailVerificationSentAt: null
+      }
+    });
+
+    await sendPushNotification(admin, prisma, {
+      userId: user.id,
+      title: 'FeedForward account verified',
+      body: 'Your account is active. You can now sign in and join the rescue network.',
+      data: { type: 'account_verified' }
+    }).catch(error => console.warn('FCM verification notification failed:', error.message));
+
+    res.json({
+      message: 'Email verified successfully. You can now sign in.',
+      user: { id: user.id, email: user.email, name: user.name, role: user.role, isVerified: true }
+    });
+  } catch (error) {
+    console.error('Email verification error:', error);
+    res.status(500).json({ message: 'Email verification failed' });
+  }
+});
+
+app.post('/auth/device-token', authenticateJWT, async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token || typeof token !== 'string' || token.length < 20) {
+      return res.status(400).json({ message: 'A valid FCM device token is required' });
+    }
+
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: { deviceToken: token }
+    });
+    res.json({ message: 'FCM device token registered' });
+  } catch (error) {
+    console.error('FCM token registration error:', error);
+    res.status(500).json({ message: 'Could not register device token' });
+  }
+});
+
 // Standard Login
 app.post('/auth/login', async (req, res) => {
   try {
-    const { email, password, channel = 'email' } = req.body;
+    const { email, password, channel = 'email', role: requestedRole } = req.body;
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
     }
@@ -661,6 +664,38 @@ app.post('/auth/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
+    // Role-match check: Prevent logging into restaurant as NGO and vice-versa
+    if (requestedRole && !['NGO', 'RESTAURANT'].includes(requestedRole)) {
+      return res.status(400).json({ message: 'Choose NGO or Restaurant / Donor to sign in.' });
+    }
+    if (requestedRole && user.role !== requestedRole) {
+      const accountType = user.role === 'RESTAURANT' ? 'Restaurant / Donor' : 'NGO Rescuer';
+      return res.status(403).json({
+        message: `This account is registered as a ${accountType}. Please select the "${accountType}" tab above to sign in.`
+      });
+    }
+
+    if (!user.isVerified) {
+      if (process.env.NODE_ENV !== 'production') {
+        // Auto-verify in development for seamless testing
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { isVerified: true, emailVerifiedAt: new Date() }
+        });
+        user.isVerified = true;
+        user.emailVerifiedAt = new Date();
+      } else {
+        return res.status(403).json({ message: 'Verify your email before signing in' });
+      }
+    } else if (!user.emailVerifiedAt) {
+      // User is marked verified; backfill the missing timestamp
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { emailVerifiedAt: new Date() }
+      });
+      user.emailVerifiedAt = new Date();
     }
 
     if (!['email', 'phone'].includes(channel) || (channel === 'phone' && !user.phone)) {
@@ -977,36 +1012,80 @@ app.get('/api/listings', async (req, res) => {
       itemType,
       isVeg,
       search,
-      sort = 'distance'
+      sort = 'distance',
+      minKarma,
+      dietaryTag
     } = req.query;
 
-    const userLat = latitude ? parseFloat(latitude) : 12.9352;
-    const userLng = longitude ? parseFloat(longitude) : 77.6245;
+    const userLat = parseFloat(latitude);
+    const userLng = parseFloat(longitude);
     const radiusMeters = parseFloat(radius) || 25000;
+
+    if (!Number.isFinite(userLat) || !Number.isFinite(userLng) ||
+        userLat < -90 || userLat > 90 || userLng < -180 || userLng > 180) {
+      return res.status(400).json({ message: 'Valid latitude and longitude are required' });
+    }
 
     const whereClause = {
       availableServings: { gt: 0 },
       status: { in: ['ACTIVE', 'PARTIALLY_RESERVED'] },
-      safeUntil: { gt: new Date() } // Filter out expired food
+      safeUntil: { gt: new Date() }, // Filter out expired food
+      restaurant: { approvalStatus: 'APPROVED' }
     };
 
+    // Restrict the listing query using the geo index (Redis Geo where available,
+    // with the database distance query / Haversine fallback handled centrally).
+    const nearbyRestaurants = await searchNearbyRestaurants(userLat, userLng, radiusMeters);
+    whereClause.restaurant.id = { in: nearbyRestaurants.map((restaurant) => restaurant.id) };
+
     if (category && category !== 'All' && category !== 'ALL') {
-      whereClause.category = String(category);
+      const categoryValue = String(category).trim();
+      const categoryType = {
+        'cooked food': 'COOKED_MEAL',
+        'cooked meals': 'COOKED_MEAL',
+        'raw ingredients': 'RAW_INGREDIENT',
+        'raw grains': 'RAW_INGREDIENT',
+        bakery: 'BAKERY',
+        'fresh produce': 'PRODUCE',
+        produce: 'PRODUCE',
+      }[categoryValue.toLowerCase()];
+
+      if (categoryType) {
+        whereClause.AND = [{
+          OR: [
+            { category: { equals: categoryValue, mode: 'insensitive' } },
+            { itemType: categoryType },
+          ],
+        }];
+      } else {
+        whereClause.category = categoryValue;
+      }
     }
     if (itemType && itemType !== 'ALL') {
       whereClause.itemType = String(itemType);
     }
+    if (minKarma && Number.isFinite(Number(minKarma))) {
+      whereClause.restaurant = { ...whereClause.restaurant, karmaScore: { gte: Math.max(0, Number(minKarma)) } };
+    }
     if (isVeg !== undefined && isVeg !== 'all' && isVeg !== '') {
       whereClause.isVeg = isVeg === 'true' || isVeg === true;
+    }
+    if (dietaryTag && String(dietaryTag).trim()) {
+      whereClause.dietary = { has: String(dietaryTag).trim() };
     }
 
     if (search && search.trim()) {
       const searchTerm = search.trim();
-      whereClause.OR = [
-        { foodName: { contains: searchTerm, mode: 'insensitive' } },
-        { category: { contains: searchTerm, mode: 'insensitive' } },
-        { storageInstructions: { contains: searchTerm, mode: 'insensitive' } },
-        { restaurant: { name: { contains: searchTerm, mode: 'insensitive' } } }
+      whereClause.AND = [
+        ...(whereClause.AND || []),
+        {
+          OR: [
+            { foodName: { contains: searchTerm, mode: 'insensitive' } },
+            { category: { contains: searchTerm, mode: 'insensitive' } },
+            { storageInstructions: { contains: searchTerm, mode: 'insensitive' } },
+            { restaurant: { name: { contains: searchTerm, mode: 'insensitive' } } }
+          ],
+        },
       ];
     }
 
@@ -1126,29 +1205,31 @@ app.post('/api/listings', authenticateJWT, requireRole('RESTAURANT'), async (req
       imageUrl
     } = req.body;
 
-    if (!foodName || !totalServings) {
-      return res.status(400).json({ message: 'foodName and totalServings are required' });
+    const count = parseInt(totalServings, 10);
+    const safeUntilHoursValue = parseFloat(safeUntilHours);
+
+    if (!foodName?.trim() || !Number.isInteger(count) || count <= 0 || count > 10000) {
+      return res.status(400).json({ message: 'foodName and a valid totalServings value are required' });
+    }
+    if (!Number.isFinite(safeUntilHoursValue) || safeUntilHoursValue <= 0 || safeUntilHoursValue > 168) {
+      return res.status(400).json({ message: 'safeUntilHours must be between 1 and 168 hours' });
     }
 
-    let restaurant = await prisma.restaurant.findFirst({
+    const restaurant = await prisma.restaurant.findFirst({
       where: { ownerId: req.user.userId }
     });
 
     if (!restaurant) {
-      restaurant = await prisma.restaurant.create({
-        data: {
-          name: `${req.user.name || 'Restaurant'} Kitchen`,
-          address: "Bengaluru Central",
-          latitude: 12.9352,
-          longitude: 77.6245,
-          approvalStatus: 'APPROVED',
-          ownerId: req.user.userId
-        }
-      });
+      return res.status(404).json({ message: 'Create and submit your restaurant profile before posting listings.' });
+    }
+    if (restaurant.approvalStatus !== 'APPROVED' || !restaurant.isActive) {
+      return res.status(403).json({ message: 'Your restaurant profile must be approved and active to post listings.' });
+    }
+    if (!Number.isFinite(restaurant.latitude) || !Number.isFinite(restaurant.longitude)) {
+      return res.status(400).json({ message: 'Your restaurant profile must include valid coordinates.' });
     }
 
-    const safeUntilDate = new Date(Date.now() + (parseFloat(safeUntilHours) * 3600 * 1000));
-    const count = parseInt(totalServings, 10);
+    const safeUntilDate = new Date(Date.now() + (safeUntilHoursValue * 3600 * 1000));
 
     const listing = await prisma.listing.create({
       data: {
@@ -1187,6 +1268,13 @@ app.post('/api/listings', authenticateJWT, requireRole('RESTAURANT'), async (req
       isVeg: listing.isVeg
     });
 
+    await sendPushNotification(admin, prisma, {
+      userId: req.user.userId,
+      title: 'New surplus food posted',
+      body: `${restaurant.name} posted ${listing.foodName}.`,
+      data: { type: 'new_listing', listingId: listing.id }
+    }).catch(error => console.warn('FCM listing notification failed:', error.message));
+
     res.status(201).json(listing);
   } catch (error) {
     console.error('Error creating listing:', error);
@@ -1204,28 +1292,28 @@ app.post('/api/listings/:id/reserve', authenticateJWT, requireRole('NGO'), async
   try {
     const listingId = parseInt(req.params.id, 10);
     const { portions = 10, shelterDelivered = "Local Community Shelter" } = req.body;
-    const requestedPortions = Math.max(1, parseInt(portions, 10));
+    const requestedPortions = parseInt(portions, 10);
+
+    if (!Number.isInteger(listingId) || listingId <= 0 || !Number.isInteger(requestedPortions) || requestedPortions <= 0) {
+      return res.status(400).json({ message: 'A valid listing ID and positive portions value are required.' });
+    }
 
     // Get NGO profile
-    let ngo = await prisma.nGO.findFirst({
+    const ngo = await prisma.nGO.findFirst({
       where: { ownerId: req.user.userId }
     });
 
     if (!ngo) {
-      ngo = await prisma.nGO.create({
-        data: {
-          name: `${req.user.name || 'NGO'} Volunteer Network`,
-          latitude: 12.9352,
-          longitude: 77.6245,
-          approvalStatus: 'APPROVED',
-          ownerId: req.user.userId
-        }
+      return res.status(403).json({
+        message: 'Your NGO profile must be approved before you can reserve food.'
       });
     }
 
-    if (ngo.approvalStatus === 'SUSPENDED') {
+    if (!isActivePartner(ngo)) {
       return res.status(403).json({
-        message: 'Your NGO account is currently suspended due to repeated policy strikes. Please contact support.'
+        message: ngo.approvalStatus === 'SUSPENDED'
+          ? 'Your NGO account is currently suspended due to repeated policy strikes. Please contact support.'
+          : 'Your NGO profile must be approved and active before you can reserve food.'
       });
     }
 
@@ -1240,28 +1328,28 @@ app.post('/api/listings/:id/reserve', authenticateJWT, requireRole('NGO'), async
         throw new Error('Listing not found');
       }
 
-      if (listing.status === 'EXPIRED' || listing.status === 'CANCELLED') {
-        throw new Error('This listing is no longer active.');
-      }
-
-      if (new Date(listing.safeUntil).getTime() <= Date.now()) {
-        throw new Error('This food listing has passed its safe-until window.');
-      }
-
-      if (listing.availableServings < requestedPortions) {
-        throw new Error(`Only ${listing.availableServings} ${listing.quantityUnit || 'servings'} available. Cannot reserve ${requestedPortions}.`);
+      const availability = canReserveListing(listing, requestedPortions);
+      if (!availability.allowed) {
+        throw new Error(availability.reason);
       }
 
       const newAvailable = listing.availableServings - requestedPortions;
       const newStatus = newAvailable === 0 ? 'FULLY_RESERVED' : 'PARTIALLY_RESERVED';
 
       const updatedListing = await tx.listing.update({
-        where: { id: listingId },
+        where: {
+          id: listingId,
+          availableServings: { gte: requestedPortions },
+        },
         data: {
           availableServings: newAvailable,
           status: newStatus
         }
       });
+
+      if (!updatedListing) {
+        throw new Error('The listing was updated concurrently. Please retry the reservation.');
+      }
 
       // Generate 4-digit pickup code
       const pickupCode = crypto.randomInt(1000, 9999).toString();
@@ -1304,6 +1392,13 @@ app.post('/api/listings/:id/reserve', authenticateJWT, requireRole('NGO'), async
       listingId: result.updatedListing.id,
       restaurantId: result.updatedListing.restaurantId
     });
+
+    await sendPushNotification(admin, prisma, {
+      userId: result.reservation.ngoId,
+      title: 'Food reserved for pickup',
+      body: `${result.reservation.listing.foodName} has been reserved for ${result.reservation.reservedServings} portions.`,
+      data: { type: 'reservation_created', reservationId: result.reservation.id }
+    }).catch(error => console.warn('FCM reservation notification failed:', error.message));
 
     res.status(201).json({
       message: 'Listing successfully reserved!',
@@ -1404,6 +1499,9 @@ app.post('/api/reservations/:id/cancel', authenticateJWT, requireRole('NGO'), as
       return res.status(400).json({ message: `Cannot cancel reservation with status '${reservation.status}'` });
     }
 
+    const cancellationIsLate = isLateCancellation(reservation.pickupDeadline);
+    const cancellationPenalty = cancellationIsLate ? -LATE_CANCELLATION_PENALTY : 0;
+
     // Atomic transaction: cancel reservation, restore portions, apply karma penalty
     const result = await prisma.$transaction(async (tx) => {
       // 1. Cancel reservation
@@ -1430,33 +1528,41 @@ app.post('/api/reservations/:id/cancel', authenticateJWT, requireRole('NGO'), as
         });
       }
 
-      // 3. Deduct Karma points (-15)
-      const newKarma = Math.max(0, ngo.karmaScore - 15);
-      const isLowKarma = newKarma < 50;
-      const newWarnings = isLowKarma ? ngo.warningCount + 1 : ngo.warningCount;
+      // 3. Apply the configured cancellation penalty and log it in the audit trail.
+      const policy = applyKarmaChange({
+        karmaScore: ngo.karmaScore,
+        strikeCount: ngo.strikeCount,
+        pointsDelta: cancellationPenalty,
+        action: cancellationPenalty < 0 ? 'LATE_CANCELLATION' : 'CANCELLED_ON_TIME',
+      });
+      const isSuspended = policy.suspensionRequired || policy.trustLevel === 'SUSPENDED';
 
       await tx.nGO.update({
         where: { id: ngo.id },
         data: {
-          karmaScore: newKarma,
-          warningCount: newWarnings
+          karmaScore: policy.karmaScore,
+          strikeCount: policy.strikeCount,
+          warningCount: policy.suspensionRequired ? ngo.warningCount + 1 : ngo.warningCount,
+          isActive: isSuspended ? false : ngo.isActive,
+          isVerified: isSuspended ? false : ngo.isVerified,
         }
       });
 
-      // 4. Log in KarmaLog
-      await tx.karmaLog.create({
-        data: {
-          entityType: 'NGO',
-          entityId: ngo.id,
-          pointsDelta: -15,
-          action: 'LATE_CANCELLATION',
-          reason: `${reason}${notes ? ` - ${notes}` : ''}`,
-          reservationId: reservation.id,
-          listingId: reservation.listingId
-        }
-      });
+      if (cancellationPenalty < 0) {
+        await tx.karmaLog.create({
+          data: {
+            entityType: 'NGO',
+            entityId: ngo.id,
+            pointsDelta: cancellationPenalty,
+            action: 'LATE_CANCELLATION',
+            reason: `${reason}${notes ? ` - ${notes}` : ''}`,
+            reservationId: reservation.id,
+            listingId: reservation.listingId
+          }
+        });
+      }
 
-      return { updatedReservation, updatedListing, newKarma };
+      return { updatedReservation, updatedListing, newKarma: policy.karmaScore, suspensionRequired: isSuspended };
     });
 
     // Real-time broadcast
@@ -1539,13 +1645,20 @@ app.post('/api/restaurant/reservations/verify-otp', authenticateJWT, requireRole
       return res.status(400).json({ message: 'This reservation was previously cancelled.' });
     }
 
-    // Verify OTP (Pickup Code)
-    const expectedOtp = String(reservation.pickupCode).trim();
-    const providedOtp = verifiedCode;
-
-    if (expectedOtp !== providedOtp) {
-      return res.status(400).json({ message: 'Invalid Verification Code. Please check the 4-digit OTP shown on the NGO representative\'s phone.' });
+    if (reservation.pickupDeadline.getTime() < Date.now()) {
+      return res.status(400).json({ message: 'This pickup deadline has passed.' });
     }
+
+    // Verify a bounded OTP attempt. The pickup code is intentionally not returned to non-owning partners.
+    const otpKey = `pickup:${reservation.id}`;
+    const session = otpAttempts.get(otpKey) || { reservationId: reservation.id, otp: reservation.pickupCode, attempts: 0, expiresAt: new Date(Date.now() + 10 * 60 * 1000) };
+    const attempt = validateOtpAttempt(session, verifiedCode);
+    if (!attempt.valid) {
+      otpAttempts.delete(otpKey);
+      return res.status(400).json({ message: attempt.reason });
+    }
+    session.attempts = attempt.attempts;
+    otpAttempts.set(otpKey, session);
 
     // Atomic transaction: mark completed, award impact and karma to both
     const meals = reservation.reservedServings || 10;
@@ -1563,24 +1676,42 @@ app.post('/api/restaurant/reservations/verify-otp', authenticateJWT, requireRole
         }
       });
 
-      // Update NGO stats (+10 Karma)
+      // Update NGO stats and policy state.
+      const ngoPolicy = applyKarmaChange({
+        karmaScore: reservation.ngo.karmaScore,
+        strikeCount: reservation.ngo.strikeCount,
+        pointsDelta: 10,
+        action: 'ON_TIME_COLLECTION',
+      });
       await tx.nGO.update({
         where: { id: reservation.ngoId },
         data: {
           totalMealsRescued: { increment: meals },
           foodWastePreventedKg: { increment: wasteKg },
           co2eAvoidedTonnes: { increment: co2Tonnes },
-          karmaScore: { increment: 10 }
+          karmaScore: ngoPolicy.karmaScore,
+          strikeCount: ngoPolicy.strikeCount,
+          isActive: ngoPolicy.suspensionRequired ? false : reservation.ngo.isActive,
+          isVerified: ngoPolicy.suspensionRequired ? false : reservation.ngo.isVerified,
         }
       });
 
-      // Update Restaurant stats (+10 Karma)
+      // Update Restaurant stats and policy state.
+      const restaurantPolicy = applyKarmaChange({
+        karmaScore: restaurant.karmaScore,
+        strikeCount: restaurant.strikeCount,
+        pointsDelta: 10,
+        action: 'SUCCESSFUL_DONATION',
+      });
       await tx.restaurant.update({
         where: { id: restaurant.id },
         data: {
           totalMealsDonated: { increment: meals },
           foodWastePreventedKg: { increment: wasteKg },
-          karmaScore: { increment: 10 }
+          karmaScore: restaurantPolicy.karmaScore,
+          strikeCount: restaurantPolicy.strikeCount,
+          isActive: restaurantPolicy.suspensionRequired ? false : restaurant.isActive,
+          isVerified: restaurantPolicy.suspensionRequired ? false : restaurant.isVerified,
         }
       });
 
@@ -1629,6 +1760,61 @@ app.post('/api/restaurant/reservations/verify-otp', authenticateJWT, requireRole
   }
 });
 
+app.post('/api/reservations/:id/request-code', authenticateJWT, requireRole('RESTAURANT'), async (req, res) => {
+  try {
+    const reservationId = parseInt(req.params.id, 10);
+    const restaurant = await prisma.restaurant.findFirst({ where: { ownerId: req.user.userId } });
+    const reservation = await prisma.reservation.findFirst({ where: { id: reservationId }, include: { listing: true } });
+    if (!restaurant || !reservation || reservation.listing.restaurantId !== restaurant.id) {
+      return res.status(404).json({ message: 'Reservation not found' });
+    }
+    if (reservation.status !== 'ready_for_pickup') return res.status(409).json({ message: 'Reservation is not active' });
+    const pickupCode = crypto.randomInt(1000, 9999).toString().padStart(4, '0');
+    const session = createOtpSession({ id: reservation.id, pickupCode }, 0);
+    otpAttempts.set(`pickup:${reservation.id}`, session);
+    await prisma.reservation.update({ where: { id: reservation.id }, data: { pickupCode } });
+    res.json({ message: 'A fresh pickup code was issued.', pickupCode, expiresInSeconds: 600 });
+  } catch (error) {
+    console.error('OTP rotation error:', error);
+    res.status(500).json({ message: 'Failed to issue pickup code' });
+  }
+});
+
+app.post('/api/reservations/:id/no-show', authenticateJWT, requireRole('RESTAURANT'), async (req, res) => {
+  try {
+    const reservationId = parseInt(req.params.id, 10);
+    const restaurant = await prisma.restaurant.findFirst({ where: { ownerId: req.user.userId } });
+    const reservation = await prisma.reservation.findFirst({ where: { id: reservationId }, include: { listing: true, ngo: true } });
+    if (!restaurant || !reservation || reservation.listing.restaurantId !== restaurant.id) {
+      return res.status(404).json({ message: 'Reservation not found' });
+    }
+    if (reservation.status !== 'ready_for_pickup' || reservation.pickupDeadline.getTime() > Date.now()) {
+      return res.status(409).json({ message: 'Reservation is not eligible for no-show processing' });
+    }
+    const policy = applyKarmaChange({ karmaScore: reservation.ngo.karmaScore, strikeCount: reservation.ngo.strikeCount, pointsDelta: -NO_SHOW_PENALTY, action: 'NO_SHOW' });
+    const result = await prisma.$transaction(async (tx) => {
+      await tx.reservation.update({ where: { id: reservation.id }, data: { status: 'cancelled', cancelledByRole: 'SYSTEM', cancellationReason: 'No-show after pickup deadline', cancelledAt: new Date() } });
+      if (new Date(reservation.listing.safeUntil) > new Date()) {
+        await tx.listing.update({
+          where: { id: reservation.listingId },
+          data: {
+            availableServings: { increment: reservation.reservedServings },
+            status: 'ACTIVE'
+          }
+        });
+      }
+      await tx.ngo.update({ where: { id: reservation.ngoId }, data: { karmaScore: policy.karmaScore, strikeCount: policy.strikeCount, isActive: policy.suspensionRequired ? false : reservation.ngo.isActive, isVerified: policy.suspensionRequired ? false : reservation.ngo.isVerified } });
+      await tx.karmaLog.create({ data: { entityType: 'NGO', entityId: reservation.ngoId, pointsDelta: -NO_SHOW_PENALTY, action: 'NO_SHOW', reason: `No-show for ${reservation.code}`, reservationId: reservation.id, listingId: reservation.listingId } });
+      return policy;
+    });
+    io.emit('reservation_no_show', { reservationId, code: reservation.code, ...result });
+    res.json({ message: 'No-show processed and penalty applied.', policy: result });
+  } catch (error) {
+    console.error('No-show processing error:', error);
+    res.status(500).json({ message: 'Failed to process no-show' });
+  }
+});
+
 // GET /api/restaurant/listings
 // RESTAURANT ONLY: Get all listings posted by this restaurant
 app.get('/api/restaurant/listings', authenticateJWT, requireRole('RESTAURANT'), async (req, res) => {
@@ -1663,7 +1849,7 @@ app.get('/api/restaurant/listings', authenticateJWT, requireRole('RESTAURANT'), 
 app.patch('/api/restaurant/listings/:id', authenticateJWT, requireRole('RESTAURANT'), async (req, res) => {
   try {
     const listingId = parseInt(req.params.id, 10);
-    const { status, availableServings, safeUntilHours, storageInstructions } = req.body;
+    const { status, availableServings, safeUntilHours, storageInstructions, foodName, category, itemType, isVeg, dietary, notes, imageUrl } = req.body;
 
     const restaurant = await prisma.restaurant.findFirst({
       where: { ownerId: req.user.userId }
@@ -1682,11 +1868,37 @@ app.patch('/api/restaurant/listings/:id', authenticateJWT, requireRole('RESTAURA
     }
 
     const updateData = {};
-    if (status) updateData.status = status;
-    if (availableServings !== undefined) updateData.availableServings = parseInt(availableServings, 10);
-    if (storageInstructions) updateData.storageInstructions = storageInstructions;
+    if (status && ['ACTIVE', 'PARTIALLY_RESERVED', 'FULLY_RESERVED', 'CANCELLED'].includes(status)) {
+      updateData.status = status;
+    }
+    if (availableServings !== undefined) {
+      const parsedAvailable = parseInt(availableServings, 10);
+      if (!Number.isInteger(parsedAvailable) || parsedAvailable < 0 || parsedAvailable > listing.totalServings) {
+        return res.status(400).json({ message: 'Available servings must be between 0 and the total quantity.' });
+      }
+      if (listing.reservations.length > 0 && parsedAvailable < listing.totalServings - listing.reservations.reduce((sum, reservation) => sum + reservation.reservedServings, 0)) {
+        return res.status(409).json({ message: 'Available servings cannot be reduced below the quantity already reserved.' });
+      }
+      updateData.availableServings = parsedAvailable;
+      if (listing.status !== 'CANCELLED') {
+        if (parsedAvailable === 0) updateData.status = 'FULLY_RESERVED';
+        else if (parsedAvailable < listing.totalServings) updateData.status = 'PARTIALLY_RESERVED';
+        else updateData.status = 'ACTIVE';
+      }
+    }
+    if (foodName?.trim()) updateData.foodName = foodName.trim();
+    if (category?.trim()) updateData.category = category.trim();
+    if (itemType?.trim()) updateData.itemType = itemType.trim();
+    if (dietary !== undefined) updateData.dietary = Array.isArray(dietary) ? dietary : [dietary];
+    if (storageInstructions?.trim()) updateData.storageInstructions = storageInstructions.trim();
+    if (notes !== undefined) updateData.notes = notes.trim() || null;
+    if (imageUrl?.trim()) updateData.imageUrl = imageUrl.trim();
     if (safeUntilHours) {
-      updateData.safeUntil = new Date(Date.now() + (parseFloat(safeUntilHours) * 3600 * 1000));
+      const parsedSafeUntilHours = parseFloat(safeUntilHours);
+      if (!Number.isFinite(parsedSafeUntilHours) || parsedSafeUntilHours <= 0 || parsedSafeUntilHours > 8760) {
+        return res.status(400).json({ message: 'Safe-until must be between 1 hour and 365 days.' });
+      }
+      updateData.safeUntil = new Date(Date.now() + parsedSafeUntilHours * 3600 * 1000);
     }
 
     const updated = await prisma.listing.update({
@@ -1704,6 +1916,32 @@ app.patch('/api/restaurant/listings/:id', authenticateJWT, requireRole('RESTAURA
   } catch (error) {
     console.error('Error updating listing:', error);
     res.status(500).json({ message: 'Failed to update listing' });
+  }
+});
+
+app.delete('/api/restaurant/listings/:id', authenticateJWT, requireRole('RESTAURANT'), async (req, res) => {
+  try {
+    const listingId = parseInt(req.params.id, 10);
+    const restaurant = await prisma.restaurant.findFirst({ where: { ownerId: req.user.userId } });
+    if (!restaurant) return res.status(404).json({ message: 'Restaurant profile not found' });
+    const listing = await prisma.listing.findFirst({
+      where: { id: listingId, restaurantId: restaurant.id },
+      include: {
+        reservations: {
+          where: { status: { in: ['ready_for_pickup', 'completed'] } }
+        }
+      }
+    });
+    if (!listing) return res.status(404).json({ message: 'Listing not found' });
+    if (listing.reservations.length > 0) {
+      return res.status(409).json({ message: 'Cannot delete a listing with active or completed reservations. Cancel or complete them first.' });
+    }
+    await prisma.listing.delete({ where: { id: listingId } });
+    io.emit('listing_deleted', { listingId });
+    res.json({ message: 'Listing deleted successfully' });
+  } catch (error) {
+    console.error('Listing delete error:', error);
+    res.status(500).json({ message: 'Failed to delete listing' });
   }
 });
 
@@ -1787,7 +2025,8 @@ app.get('/api/restaurant/history', authenticateJWT, requireRole('RESTAURANT'), a
       completedAt: h.completedAt
         ? new Date(h.completedAt).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
         : 'Completed',
-      shelterDelivered: h.shelterDelivered
+      shelterDelivered: h.shelterDelivered,
+      karmaDelta: 10,
     }));
 
     res.json(formatted);
@@ -1874,7 +2113,8 @@ app.get('/api/history', authenticateJWT, requireRole('NGO'), async (req, res) =>
         : "Recently",
       shelterDelivered: h.shelterDelivered || "Asha Kiran Shelter",
       cancellationReason: h.cancellationReason,
-      fssaiVerified: h.fssaiVerified
+      fssaiVerified: h.fssaiVerified,
+      karmaDelta: h.status === 'completed' ? 10 : -15
     }));
 
     res.json(formatted);
@@ -1884,9 +2124,265 @@ app.get('/api/history', authenticateJWT, requireRole('NGO'), async (req, res) =>
   }
 });
 
+// GET /api/karma/history
+// Returns authenticated partner's recent karma log history
+app.get('/api/karma/history', authenticateJWT, async (req, res) => {
+  try {
+    const role = req.user.role;
+    let entityId = null;
+
+    if (role === 'NGO') {
+      const ngo = await prisma.nGO.findFirst({ where: { ownerId: req.user.userId } });
+      if (ngo) entityId = ngo.id;
+    } else if (role === 'RESTAURANT') {
+      const resto = await prisma.restaurant.findFirst({ where: { ownerId: req.user.userId } });
+      if (resto) entityId = resto.id;
+    }
+
+    if (!entityId) {
+      return res.json([]);
+    }
+
+    const logs = await prisma.karmaLog.findMany({
+      where: { entityType: role, entityId },
+      orderBy: { createdAt: 'desc' },
+      take: 40
+    });
+
+    const formatted = logs.map(l => ({
+      id: l.id,
+      pointsDelta: l.pointsDelta,
+      action: l.action,
+      reason: l.reason || (l.pointsDelta > 0 ? 'Verified rescue activity' : 'Policy infraction penalty'),
+      createdAt: new Date(l.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    }));
+
+    res.json(formatted);
+  } catch (error) {
+    console.error('Error fetching karma logs:', error);
+    res.status(500).json({ message: 'Failed to fetch karma logs' });
+  }
+});
+
+// GET /api/leaderboard
+// Returns city-wide top Karma Rescuers (NGOs) and Donors (Restaurants)
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    const [topRestaurants, topNgos] = await Promise.all([
+      prisma.restaurant.findMany({
+        where: { approvalStatus: 'APPROVED' },
+        select: {
+          id: true,
+          name: true,
+          cuisineType: true,
+          address: true,
+          karmaScore: true,
+          totalMealsDonated: true,
+          foodWastePreventedKg: true
+        },
+        orderBy: [{ karmaScore: 'desc' }, { totalMealsDonated: 'desc' }],
+        take: 10
+      }),
+      prisma.nGO.findMany({
+        where: { approvalStatus: 'APPROVED' },
+        select: {
+          id: true,
+          name: true,
+          mission: true,
+          address: true,
+          karmaScore: true,
+          totalMealsRescued: true,
+          foodWastePreventedKg: true,
+          co2eAvoidedTonnes: true
+        },
+        orderBy: [{ karmaScore: 'desc' }, { totalMealsRescued: 'desc' }],
+        take: 10
+      })
+    ]);
+
+    res.json({
+      restaurants: topRestaurants.map((r, idx) => ({ ...r, rank: idx + 1 })),
+      ngos: topNgos.map((n, idx) => ({ ...n, rank: idx + 1 }))
+    });
+  } catch (error) {
+    console.error('Error fetching leaderboard:', error);
+    res.status(500).json({ message: 'Failed to fetch leaderboard' });
+  }
+});
+
 // ------------------------------------------
-// PROFILE & LOGISTICS (WITH GOOGLE MAPS LAT/LNG)
+// ADMIN PARTNER APPROVAL & DOCUMENT REVIEW
 // ------------------------------------------
+
+// GET /api/admin/partners
+// ADMIN ONLY: Lists pending and active partners with legal-document metadata.
+app.get('/api/admin/partners', authenticateJWT, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const [restaurants, ngos] = await Promise.all([
+      prisma.restaurant.findMany({
+        include: { owner: { select: { id: true, email: true, name: true } } },
+        orderBy: [{ approvalStatus: 'asc' }, { createdAt: 'desc' }]
+      }),
+      prisma.nGO.findMany({
+        include: { owner: { select: { id: true, email: true, name: true } } },
+        orderBy: [{ approvalStatus: 'asc' }, { createdAt: 'desc' }]
+      })
+    ]);
+
+    res.json({
+      restaurants: restaurants.map(partner => ({
+        ...partner,
+        partnerType: 'RESTAURANT',
+        owner: partner.owner
+      })),
+      ngos: ngos.map(partner => ({
+        ...partner,
+        partnerType: 'NGO',
+        owner: partner.owner
+      }))
+    });
+  } catch (error) {
+    console.error('Admin partners error:', error);
+    res.status(500).json({ message: 'Failed to load partner applications', error: error.message });
+  }
+});
+
+// PATCH /api/admin/partners/:type/:id/review
+// ADMIN ONLY: Approves, rejects, or suspends a partner and records the audit decision.
+app.patch('/api/admin/partners/:type/:id/review', authenticateJWT, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const partnerType = req.params.type;
+    const partnerId = parseInt(req.params.id, 10);
+    const { approvalStatus, reviewReason, documentStatus } = req.body;
+    const allowedStatuses = ['PENDING', 'APPROVED', 'REJECTED', 'SUSPENDED'];
+
+    if (!['RESTAURANT', 'NGO'].includes(partnerType) || !Number.isInteger(partnerId)) {
+      return res.status(400).json({ message: 'A valid partner type and ID are required.' });
+    }
+    if (approvalStatus && !allowedStatuses.includes(approvalStatus)) {
+      return res.status(400).json({ message: 'Invalid approval status.' });
+    }
+    if (!approvalStatus && !documentStatus) {
+      return res.status(400).json({ message: 'Provide an approval status or document status.' });
+    }
+
+    const model = partnerType === 'RESTAURANT' ? prisma.restaurant : prisma.ngo;
+    const partner = await model.findUnique({ where: { id: partnerId } });
+    if (!partner) {
+      return res.status(404).json({ message: 'Partner not found.' });
+    }
+
+    const nextStatus = approvalStatus || partner.approvalStatus;
+    const nextDocumentStatus = documentStatus || partner.documentStatus;
+    const result = await prisma.$transaction(async (tx) => {
+      const updatedPartner = await tx[partnerType.toLowerCase()].update({
+        where: { id: partnerId },
+        data: {
+          approvalStatus: nextStatus,
+          documentStatus: nextDocumentStatus,
+          approvalReason: reviewReason?.trim() || null,
+          approvalReviewAt: new Date(),
+          approvedById: req.user.userId,
+          isActive: nextStatus === 'APPROVED',
+          isVerified: nextStatus === 'APPROVED'
+        }
+      });
+      await tx.adminAudit.create({
+        data: {
+          action: `PARTNER_${nextStatus}`,
+          actorId: req.user.userId,
+          targetType: partnerType,
+          targetId: partnerId,
+          details: { previousStatus: partner.approvalStatus, nextStatus, reviewReason: reviewReason?.trim() || null }
+        }
+      });
+      return updatedPartner;
+    });
+
+    res.json({
+      message: `Partner ${nextStatus.toLowerCase()}.`,
+      partner: { ...result, partnerType }
+    });
+  } catch (error) {
+    console.error('Partner review error:', error);
+    res.status(500).json({ message: 'Failed to review partner', error: error.message });
+  }
+});
+
+app.post('/api/reports', authenticateJWT, async (req, res) => {
+  try {
+    const { targetType, targetId, reservationId, reason, details } = req.body;
+    if (!['NGO', 'RESTAURANT'].includes(targetType) || !Number.isInteger(Number(targetId)) || !reason?.trim()) {
+      return res.status(400).json({ message: 'Target type, target ID, and reason are required.' });
+    }
+    const report = await prisma.report.create({
+      data: {
+        reporterType: req.user.role,
+        reporterId: req.user.userId,
+        targetType,
+        targetId: Number(targetId),
+        reservationId: reservationId ? Number(reservationId) : null,
+        reason: reason.trim(),
+        details: details?.trim() || null,
+        status: 'PENDING'
+      }
+    });
+    res.status(201).json(report);
+  } catch (error) {
+    console.error('Report creation error:', error);
+    res.status(500).json({ message: 'Failed to submit report' });
+  }
+});
+
+app.get('/api/admin/reports', authenticateJWT, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const reports = await prisma.report.findMany({
+      include: { reporter: { select: { id: true, name: true, email: true } } },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(reports);
+  } catch (error) {
+    console.error('Report list error:', error);
+    res.status(500).json({ message: 'Failed to load reports' });
+  }
+});
+
+app.patch('/api/admin/reports/:id/review', authenticateJWT, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const reportId = parseInt(req.params.id, 10);
+    const { status, resolution } = req.body;
+    if (!['PENDING', 'REVIEWING', 'RESOLVED', 'DISMISSED'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid report status.' });
+    }
+    const report = await prisma.report.findUnique({ where: { id: reportId } });
+    if (!report) return res.status(404).json({ message: 'Report not found' });
+    const result = await prisma.$transaction(async (tx) => {
+      const updated = await tx.report.update({
+        where: { id: reportId },
+        data: {
+          status,
+          resolution: resolution?.trim() || null,
+          resolvedAt: status === 'RESOLVED' || status === 'DISMISSED' ? new Date() : null,
+          resolvedById: req.user.userId
+        }
+      });
+      await tx.adminAudit.create({
+        data: {
+          action: `REPORT_${status}`,
+          actorId: req.user.userId,
+          targetType: 'REPORT',
+          targetId: reportId,
+          details: { previousStatus: report.status, nextStatus: status, resolution: resolution?.trim() || null }
+        }
+      });
+      return updated;
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('Report review error:', error);
+    res.status(500).json({ message: 'Failed to review report' });
+  }
+});
 
 // GET /api/profile
 app.get('/api/profile', authenticateJWT, async (req, res) => {
@@ -1934,6 +2430,11 @@ app.get('/api/profile', authenticateJWT, async (req, res) => {
         mission: ngo.mission || "Zero hunger through food rescue",
         isVerified: ngo.isVerified ?? true,
         approvalStatus: ngo.approvalStatus || 'APPROVED',
+        documentStatus: ngo.documentStatus || 'NOT_SUBMITTED',
+        documentName: ngo.documentName,
+        documentUrl: ngo.documentUrl,
+        approvalReason: ngo.approvalReason,
+        approvalReviewAt: ngo.approvalReviewAt,
         karmaScore: ngo.karmaScore ?? 100,
         warningCount: ngo.warningCount || 0,
         strikeCount: ngo.strikeCount || 0,
@@ -1979,6 +2480,11 @@ app.get('/api/profile', authenticateJWT, async (req, res) => {
         fssaiNumber: restaurant.fssaiNumber,
         cuisineType: restaurant.cuisineType || "Multi-Cuisine",
         approvalStatus: restaurant.approvalStatus || 'APPROVED',
+        documentStatus: restaurant.documentStatus || 'NOT_SUBMITTED',
+        documentName: restaurant.documentName,
+        documentUrl: restaurant.documentUrl,
+        approvalReason: restaurant.approvalReason,
+        approvalReviewAt: restaurant.approvalReviewAt,
         karmaScore: restaurant.karmaScore ?? 100,
         warningCount: restaurant.warningCount || 0,
         strikeCount: restaurant.strikeCount || 0,
@@ -2005,11 +2511,15 @@ app.put('/api/profile', authenticateJWT, async (req, res) => {
       latitude,
       longitude,
       tagline,
-      darpanId
+      darpanId,
+      documentName,
+      documentUrl,
+      documentStatus
     } = req.body;
 
     const lat = latitude !== undefined ? parseFloat(latitude) : undefined;
     const lng = longitude !== undefined ? parseFloat(longitude) : undefined;
+    const normalizedDocumentStatus = documentStatus || 'PENDING_REVIEW';
 
     let updatedEntity;
     if (req.user.role === 'NGO') {
@@ -2027,7 +2537,11 @@ app.put('/api/profile', authenticateJWT, async (req, res) => {
             latitude: lat !== undefined && !isNaN(lat) ? lat : undefined,
             longitude: lng !== undefined && !isNaN(lng) ? lng : undefined,
             tagline: tagline || undefined,
-            darpanId: darpanId || undefined
+            darpanId: darpanId || undefined,
+            documentName: documentName?.trim() || undefined,
+            documentUrl: documentUrl?.trim() || undefined,
+            documentStatus: normalizedDocumentStatus,
+            approvalStatus: documentName || documentUrl ? 'PENDING' : undefined
           }
         });
         if (lat && lng) {
@@ -2046,7 +2560,11 @@ app.put('/api/profile', authenticateJWT, async (req, res) => {
             name: name || undefined,
             address: operatingBase || undefined,
             latitude: lat !== undefined && !isNaN(lat) ? lat : undefined,
-            longitude: lng !== undefined && !isNaN(lng) ? lng : undefined
+            longitude: lng !== undefined && !isNaN(lng) ? lng : undefined,
+            documentName: documentName?.trim() || undefined,
+            documentUrl: documentUrl?.trim() || undefined,
+            documentStatus: normalizedDocumentStatus,
+            approvalStatus: documentName || documentUrl ? 'PENDING' : undefined
           }
         });
         if (lat && lng) {

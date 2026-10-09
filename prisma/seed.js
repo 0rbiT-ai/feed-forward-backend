@@ -14,14 +14,18 @@ async function main() {
   // 1. Restaurant 1: Royal Biryani House
   let restoUser1 = await prisma.user.upsert({
     where: { email: 'royalbiryani@feedforward.org' },
-    update: {},
+    update: {
+      isVerified: true,
+      emailVerifiedAt: new Date(),
+    },
     create: {
       email: 'royalbiryani@feedforward.org',
       phone: '+919876543210',
       password: passwordHash,
       name: 'Chef Rajesh Sharma',
       role: 'RESTAURANT',
-      isVerified: true
+      isVerified: true,
+      emailVerifiedAt: new Date(),
     }
   });
 
@@ -56,14 +60,18 @@ async function main() {
   // 2. Restaurant 2: The Rameshwaram Cafe
   let restoUser2 = await prisma.user.upsert({
     where: { email: 'rameshwaram@feedforward.org' },
-    update: {},
+    update: {
+      isVerified: true,
+      emailVerifiedAt: new Date(),
+    },
     create: {
       email: 'rameshwaram@feedforward.org',
       phone: '+919876543211',
       password: passwordHash,
       name: 'Raghavendra Rao',
       role: 'RESTAURANT',
-      isVerified: true
+      isVerified: true,
+      emailVerifiedAt: new Date(),
     }
   });
 
@@ -98,14 +106,18 @@ async function main() {
   // 3. Restaurant 3: FarmFresh Wholesale & Agro
   let restoUser3 = await prisma.user.upsert({
     where: { email: 'farmfresh@feedforward.org' },
-    update: {},
+    update: {
+      isVerified: true,
+      emailVerifiedAt: new Date(),
+    },
     create: {
       email: 'farmfresh@feedforward.org',
       phone: '+919876543212',
       password: passwordHash,
       name: 'Kisan Agro Collective',
       role: 'RESTAURANT',
-      isVerified: true
+      isVerified: true,
+      emailVerifiedAt: new Date(),
     }
   });
 
@@ -140,14 +152,18 @@ async function main() {
   // 4. NGO: Robin Hood Army
   let ngoUser = await prisma.user.upsert({
     where: { email: 'robinhood@feedforward.org' },
-    update: {},
+    update: {
+      isVerified: true,
+      emailVerifiedAt: new Date(),
+    },
     create: {
       email: 'robinhood@feedforward.org',
       phone: '+919876543219',
       password: passwordHash,
       name: 'Robin Hood Army Bengaluru',
       role: 'NGO',
-      isVerified: true
+      isVerified: true,
+      emailVerifiedAt: new Date(),
     }
   });
 
