@@ -40,7 +40,7 @@ This is the backend for the Feed-forward application, built with Node.js, Expres
    JWT_SECRET="<random-access-token-secret>"
    JWT_REFRESH_SECRET="<different-random-refresh-token-secret>"
    JWT_ACCESS_EXPIRES_IN="15m"
-   JWT_REFRESH_EXPIRES_IN="7d"
+   JWT_REFRESH_EXPIRES_IN="30d"
 
    # Port
    PORT=5000

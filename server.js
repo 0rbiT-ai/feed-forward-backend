@@ -331,7 +331,7 @@ const generateRefreshToken = (user) => {
   return jwt.sign(
     { userId: user.id, role: user.role || 'NGO' },
     jwtRefreshSecret,
-    { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d', algorithm: 'HS256' }
+    { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d', algorithm: 'HS256' }
   );
 };
 
@@ -347,7 +347,7 @@ const setAuthCookies = (res, accessToken, refreshToken) => {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
     sameSite: 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
   });
 };
 
@@ -1158,7 +1158,7 @@ app.get('/api/listings', async (req, res) => {
         restaurantId: item.restaurant?.id,
         restaurantKarma: item.restaurant?.karmaScore || 100,
         address: item.restaurant?.address || "Bengaluru",
-        contactPhone: item.restaurant?.phone || "+91 80 4000 0000",
+        contactPhone: item.restaurant?.phone || null,
         fssaiNumber: item.restaurant?.fssaiNumber || null
       };
     });
@@ -1439,7 +1439,7 @@ app.get('/api/reservations', authenticateJWT, requireRole('NGO'), async (req, re
       id: r.code,
       dbId: r.id,
       restaurant: r.listing?.restaurant?.name || "Partner Restaurant",
-      restaurantPhone: r.listing?.restaurant?.phone || "+91 80 4920 1888",
+      restaurantPhone: r.listing?.restaurant?.phone || null,
       address: r.listing?.restaurant?.address || "Koramangala, Bengaluru",
       foodName: r.listing?.foodName || "Surplus Meals",
       reservedServings: r.reservedServings,
@@ -1976,7 +1976,7 @@ app.get('/api/restaurant/reservations', authenticateJWT, requireRole('RESTAURANT
       reservedServings: r.reservedServings,
       quantityUnit: r.listing.quantityUnit || 'servings',
       ngoName: r.ngo.name,
-      ngoPhone: r.ngo.phone || "Contact via App",
+      ngoPhone: r.ngo.phone || null,
       ngoTagline: r.ngo.tagline,
       ngoKarma: r.ngo.karmaScore || 100,
       pickupDeadline: new Date(r.pickupDeadline).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
